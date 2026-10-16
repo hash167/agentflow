@@ -1,0 +1,27 @@
+{
+  "host": "127.0.0.1",
+  "port": 4817,
+  "auditLog": "./audit.jsonl",
+  "apiKeys": [
+    {
+      "name": "admin",
+      "key": "dev-admin-key-change-me",
+      "allow": ["*"]
+    },
+    {
+      "name": "code-reviewer",
+      "key": "dev-reviewer-key-change-me",
+      "allow": ["demo-tools:current_time", "demo-tools:sha256"]
+    }
+  ],
+  "upstreams": [
+    {
+      "name": "demo-tools",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "tsx", "src/demo-upstream/server.ts"]
+      }
+    }
+  ]
+}
