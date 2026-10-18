@@ -1,0 +1,89 @@
+# Deploys the agent gateway. Before applying:
+#
+#   1. Build and push the image, then set it below:
+#        docker build -t <your-registry>/agent-gateway:0.1.0 .
+#        docker push <your-registry>/agent-gateway:0.1.0
+#   2. Create the ConfigMap from the container config:
+#        kubectl -n agent-gateway create configmap gateway-config \
+#          --from-file=config.json=deploy/k8s/gateway.config.json
+#   3. Create the API-key secret (never commit real keys):
+#        kubectl -n agent-gateway create secret generic gateway-keys \
+#          --from-literal=GATEWAY_ADMIN_KEY="$(openssl rand -hex 32)" \
+#          --from-literal=GATEWAY_REVIEWER_KEY="$(openssl rand -hex 32)"
+#   4. kubectl apply -f deploy/k8s/manifests.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-gateway
+  namespace: agent-gateway
+  labels:
+    app: agent-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-gateway
+  template:
+    metadata:
+      labels:
+        app: agent-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: <your-registry>/agent-gateway:0.1.0
+          ports:
+            - containerPort: 4817
+              name: mcp
+          envFrom:
+            - secretRef:
+                name: gateway-keys
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agent-gateway
+              readOnly: true
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-gateway
+  namespace: agent-gateway
+  labels:
+    app: agent-gateway
+spec:
+  selector:
+    app: agent-gateway
+  ports:
+    - name: mcp
+      port: 80
+      targetPort: mcp

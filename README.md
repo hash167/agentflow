@@ -95,6 +95,26 @@ internal/config/          config schema, env substitution, validation
 
 Built on the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
 
+## Deploy to Kubernetes
+
+A multi-stage `Dockerfile` (distroless, static binary, runs as nonroot) and manifests under `deploy/k8s/` are included:
+
+```bash
+docker build -t <your-registry>/agent-gateway:0.1.0 .
+docker push <your-registry>/agent-gateway:0.1.0
+
+kubectl create namespace agent-gateway
+kubectl -n agent-gateway create configmap gateway-config \
+  --from-file=config.json=deploy/k8s/gateway.config.json
+kubectl -n agent-gateway create secret generic gateway-keys \
+  --from-literal=GATEWAY_ADMIN_KEY="$(openssl rand -hex 32)" \
+  --from-literal=GATEWAY_REVIEWER_KEY="$(openssl rand -hex 32)"
+# set the image in deploy/k8s/manifests.yaml, then:
+kubectl apply -f deploy/k8s/manifests.yaml
+```
+
+The container config (`deploy/k8s/gateway.config.json`) binds 0.0.0.0, reads API keys from the `gateway-keys` Secret via `${ENV}` substitution, and writes the audit log to an `emptyDir` at `/data`. Readiness and liveness probes hit `/healthz`. The Service is ClusterIP; expose it on your tailnet with the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator) or an ingress of your choice.
+
 ## Notes
 
 - The gateway is stateless per request, so it sits happily behind a reverse proxy; terminate TLS there (Caddy/Traefik/nginx) before exposing it off-host.

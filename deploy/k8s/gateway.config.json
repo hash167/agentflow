@@ -1,0 +1,26 @@
+{
+  "host": "0.0.0.0",
+  "port": 4817,
+  "auditLog": "/data/audit.jsonl",
+  "apiKeys": [
+    {
+      "name": "admin",
+      "key": "${GATEWAY_ADMIN_KEY}",
+      "allow": ["*"]
+    },
+    {
+      "name": "code-reviewer",
+      "key": "${GATEWAY_REVIEWER_KEY}",
+      "allow": ["demo-tools:current_time", "demo-tools:sha256"]
+    }
+  ],
+  "upstreams": [
+    {
+      "name": "demo-tools",
+      "transport": {
+        "type": "stdio",
+        "command": "/app/demo-upstream"
+      }
+    }
+  ]
+}
