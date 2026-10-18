@@ -1,6 +1,13 @@
 # agent-gateway
 
-A self-hosted **MCP agent gateway** written in **Go** — a lightweight stand-in for AWS AgentCore Gateway that you can run on your own servers (single static binary, no runtime dependencies). It exposes **one authenticated MCP endpoint** that your agents (Cursor CLI, Cursor Cloud Agents, Temporal activities, anything that speaks MCP over Streamable HTTP) connect to, and it:
+A self-hosted **remote agent platform for code review**, written in **Go**, with two components:
+
+1. **The agent gateway** (`cmd/gateway`) — the tool/data plane: a lightweight stand-in for AWS AgentCore Gateway. One authenticated MCP endpoint aggregating your upstream MCP servers with per-key tool policies and audit logging.
+2. **The orchestrator** (`cmd/orchestrator`) — the control plane: a [Temporal](https://temporal.io) workflow that turns PR webhooks into agent review runs with retries, heartbeats, budget guards, re-review on new pushes, and queryable status.
+
+## The gateway (tool/data plane)
+
+It exposes **one authenticated MCP endpoint** that your agents (Cursor CLI, Cursor Cloud Agents, Temporal activities, anything that speaks MCP over Streamable HTTP) connect to, and it:
 
 - **Aggregates upstream MCP servers** (stdio or HTTP) behind a single URL, namespacing tools as `<upstream>__<tool>`.
 - **Authenticates callers** with per-agent API keys (`Authorization: Bearer <key>`).
@@ -83,17 +90,48 @@ Everything is in `gateway.config.json` (or pass a path: `go run ./cmd/gateway ./
 ## Layout
 
 ```
-cmd/gateway/              entrypoint: load config, connect upstreams, listen
+cmd/gateway/              gateway entrypoint: load config, connect upstreams, listen
 cmd/demo-upstream/        bundled demo MCP server (echo, current_time, sha256, generate_uuid)
-cmd/smoke/                end-to-end smoke test (auth, policy, round-trip)
+cmd/smoke/                gateway end-to-end smoke test (auth, policy, round-trip)
+cmd/orchestrator/         control plane: Temporal worker + PR webhook receiver
+cmd/mock-reviewer/        deterministic stand-in review agent (no API key needed)
 internal/gateway/         HTTP handler, auth, and the per-principal MCP server
 internal/upstream/        upstream MCP client manager (stdio + streamable HTTP)
 internal/policy/          allow-pattern matching and tool-name namespacing
 internal/audit/           JSONL audit logger
-internal/config/          config schema, env substitution, validation
+internal/config/          gateway config schema, env substitution, validation
+internal/orchestrator/    CodeReviewWorkflow, activities, config, tests
 ```
 
 Built on the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
+
+## The orchestrator (control plane)
+
+The orchestrator runs two things in one binary: a Temporal **worker** hosting `CodeReviewWorkflow`, and a **webhook receiver** that starts (or signals) one workflow per PR.
+
+```bash
+temporal server start-dev          # or your self-hosted Temporal cluster
+go run ./cmd/orchestrator          # webhook on http://127.0.0.1:4819
+```
+
+Trigger a review (the request carries the diff inline, or a `diffUrl` the workflow fetches):
+
+```bash
+curl -X POST http://127.0.0.1:4819/hooks/pr -H 'Content-Type: application/json' \
+  -d '{"repo":"alice/widgets","prNumber":42,"headSha":"abc1234","diff":"..."}'
+
+curl 'http://127.0.0.1:4819/reviews?repo=alice/widgets&pr=42'   # status + last result
+```
+
+How it behaves:
+
+- **One workflow per PR** (`review:<repo>#<n>`): webhook retries and new pushes are delivered as signals to the same execution via signal-with-start, so reviews never duplicate; a push that lands mid-review triggers a fresh review of the newest head.
+- **Activities are retried** (4 attempts, exponential backoff), **heartbeat** while the agent runs, and respect a **diff budget** (`review.maxDiffBytes`, default 300 KB) so a webhook storm or giant vendored diff can't drain your usage pool.
+- **Pluggable reviewer**: `review.reviewerCommand` gets `{"repo","prNumber","title","diff"}` on stdin and must print `{"summary","findings":[{file,line,severity,message}]}` on stdout. The default is the bundled deterministic `cmd/mock-reviewer` so everything runs without credentials. For production, point it at a script that invokes the headless Cursor CLI, e.g. `agent -p "Review this diff... output only JSON: ..." --model grok-4.7 --force=false`, with the gateway configured in `mcp.json` and `CURSOR_API_KEY` set.
+- **Pluggable sink**: `review.sink.type` is `file` (JSON per PR under `reviews/`) or `github` (posts a formatted PR comment; requires `GITHUB_TOKEN`).
+- Set `WEBHOOK_TOKEN` to require an `X-Webhook-Token` header on the webhook; leave it unset only on localhost.
+
+Configuration lives in `orchestrator.config.json` (Temporal host/namespace/task queue, webhook host/port, review settings). Tests: `go test ./...` exercises the workflow against Temporal's test suite.
 
 ## Deploy to Kubernetes
 

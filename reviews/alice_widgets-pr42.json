@@ -1,0 +1,32 @@
+{
+  "repo": "alice/widgets",
+  "prNumber": 42,
+  "headSha": "def5678",
+  "summary": "Mock review of alice/widgets#42: 1 changed file(s), 4 finding(s).",
+  "findings": [
+    {
+      "file": "pay.go",
+      "line": 3,
+      "severity": "info",
+      "message": "Leftover TODO/FIXME marker"
+    },
+    {
+      "file": "pay.go",
+      "line": 5,
+      "severity": "warning",
+      "message": "Possible leftover debug output"
+    },
+    {
+      "file": "pay.go",
+      "line": 6,
+      "severity": "error",
+      "message": "Possible hardcoded credential"
+    },
+    {
+      "file": "pay.go",
+      "line": 8,
+      "severity": "warning",
+      "message": "panic() in changed code; prefer returning an error"
+    }
+  ]
+}

@@ -46,7 +46,7 @@ var (
 		{regexp.MustCompile(`\b(TODO|FIXME)\b`), "info", "Leftover TODO/FIXME marker"},
 		{regexp.MustCompile(`\b(fmt\.Println|console\.log|print\()`), "warning", "Possible leftover debug output"},
 		{regexp.MustCompile(`\bpanic\(`), "warning", "panic() in changed code; prefer returning an error"},
-		{regexp.MustCompile(`(?i)(password|secret|api_?key)\s*[:=]\s*["'][^"']+["']`), "error", "Possible hardcoded credential"},
+		{regexp.MustCompile(`(?i)(password|secret|api_?key)\s*:?=\s*["'][^"']+["']`), "error", "Possible hardcoded credential"},
 	}
 )
 
