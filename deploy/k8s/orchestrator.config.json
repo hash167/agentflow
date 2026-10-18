@@ -1,0 +1,19 @@
+{
+  "temporal": {
+    "hostPort": "temporal-frontend.temporal.svc.cluster.local:7233",
+    "namespace": "default",
+    "taskQueue": "code-review"
+  },
+  "webhook": {
+    "host": "0.0.0.0",
+    "port": 4819
+  },
+  "review": {
+    "reviewerCommand": ["/app/mock-reviewer"],
+    "maxDiffBytes": 300000,
+    "sink": {
+      "type": "file",
+      "dir": "/data/reviews"
+    }
+  }
+}

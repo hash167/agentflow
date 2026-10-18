@@ -1,0 +1,27 @@
+# Install (after agent-gateway.service's user/dir setup):
+#   go build -o /opt/agentflow/orchestrator ./cmd/orchestrator
+#   go build -o /opt/agentflow/mock-reviewer ./cmd/mock-reviewer
+#   sudo cp orchestrator.config.json /opt/agentflow/   # point reviewerCommand
+#                                                      # at /opt/agentflow/mock-reviewer
+#                                                      # or your agent CLI script
+#   sudo cp deploy/systemd/orchestrator.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now orchestrator
+[Unit]
+Description=Code-review orchestrator (Temporal worker + webhook)
+After=network-online.target temporal-dev.service
+Wants=network-online.target
+
+[Service]
+User=agentflow
+WorkingDirectory=/opt/agentflow
+ExecStart=/opt/agentflow/orchestrator /opt/agentflow/orchestrator.config.json
+Restart=on-failure
+RestartSec=5
+# Put WEBHOOK_TOKEN / GITHUB_TOKEN / CURSOR_API_KEY here (chmod 600):
+EnvironmentFile=-/etc/agentflow/orchestrator.env
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/agentflow
+
+[Install]
+WantedBy=multi-user.target

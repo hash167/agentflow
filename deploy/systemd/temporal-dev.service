@@ -1,0 +1,31 @@
+# Single-node Temporal for a home lab, using the Temporal CLI dev server with
+# a persistent SQLite database. For anything beyond one machine, run a real
+# Temporal cluster (docker-compose or the Helm chart) instead.
+#
+# Install:
+#   curl -sSf https://temporal.download/cli.sh | sh
+#   sudo cp ~/.temporalio/bin/temporal /usr/local/bin/
+#   sudo mkdir -p /var/lib/temporal && sudo chown agentflow /var/lib/temporal
+#   sudo cp deploy/systemd/temporal-dev.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now temporal-dev
+#
+# Web UI on http://<server>:8233, gRPC frontend on :7233.
+[Unit]
+Description=Temporal dev server (single node, SQLite persistence)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agentflow
+ExecStart=/usr/local/bin/temporal server start-dev \
+  --ip 0.0.0.0 \
+  --db-filename /var/lib/temporal/temporal.db \
+  --log-level warn
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/temporal
+
+[Install]
+WantedBy=multi-user.target

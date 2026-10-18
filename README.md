@@ -133,14 +133,20 @@ How it behaves:
 
 Configuration lives in `orchestrator.config.json` (Temporal host/namespace/task queue, webhook host/port, review settings). Tests: `go test ./...` exercises the workflow against Temporal's test suite.
 
-## Deploy to Kubernetes
+## Deployment
 
-A multi-stage `Dockerfile` (distroless, static binary, runs as nonroot) and manifests under `deploy/k8s/` are included:
+One multi-stage `Dockerfile` builds all four static binaries into a single distroless image (gateway is the entrypoint; the orchestrator deployment overrides `command`). Two supported paths:
+
+### Option 1: Kubernetes (`deploy/k8s/`)
 
 ```bash
 docker build -t <your-registry>/agent-gateway:0.1.0 .
 docker push <your-registry>/agent-gateway:0.1.0
+```
 
+**Gateway** (tool plane):
+
+```bash
 kubectl create namespace agent-gateway
 kubectl -n agent-gateway create configmap gateway-config \
   --from-file=config.json=deploy/k8s/gateway.config.json
@@ -151,7 +157,37 @@ kubectl -n agent-gateway create secret generic gateway-keys \
 kubectl apply -f deploy/k8s/manifests.yaml
 ```
 
-The container config (`deploy/k8s/gateway.config.json`) binds 0.0.0.0, reads API keys from the `gateway-keys` Secret via `${ENV}` substitution, and writes the audit log to an `emptyDir` at `/data`. Readiness and liveness probes hit `/healthz`. The Service is ClusterIP; expose it on your tailnet with the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator) or an ingress of your choice.
+**Orchestrator** (control plane) — needs a reachable Temporal cluster first (official Helm chart: `helm repo add temporal https://temporalio.github.io/helm-charts && helm install temporal temporal/temporal -n temporal --create-namespace`), then:
+
+```bash
+# edit deploy/k8s/orchestrator.config.json: temporal.hostPort, sink type
+kubectl -n agent-gateway create configmap orchestrator-config \
+  --from-file=config.json=deploy/k8s/orchestrator.config.json
+kubectl -n agent-gateway create secret generic orchestrator-tokens \
+  --from-literal=WEBHOOK_TOKEN="$(openssl rand -hex 24)" \
+  --from-literal=GITHUB_TOKEN="<your-pat-or-empty>"
+# set the image in deploy/k8s/orchestrator.yaml, then:
+kubectl apply -f deploy/k8s/orchestrator.yaml
+```
+
+Point your forge's PR webhook at the orchestrator Service (`/hooks/pr`, with the `X-Webhook-Token` header). Both container configs bind 0.0.0.0, read secrets from env, write runtime data to an `emptyDir` at `/data`, and expose `/healthz` for probes. Services are ClusterIP; expose them on your tailnet with the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator) or an ingress of your choice.
+
+### Option 2: systemd on a plain server (`deploy/systemd/`)
+
+For a single home server, skip k8s entirely: three units with install steps in their header comments.
+
+```bash
+go build -o /opt/agentflow/gateway ./cmd/gateway
+go build -o /opt/agentflow/demo-upstream ./cmd/demo-upstream
+go build -o /opt/agentflow/orchestrator ./cmd/orchestrator
+go build -o /opt/agentflow/mock-reviewer ./cmd/mock-reviewer
+# then follow the comments in:
+#   deploy/systemd/temporal-dev.service    single-node Temporal, SQLite persistence
+#   deploy/systemd/agent-gateway.service   tool plane on :4817
+#   deploy/systemd/orchestrator.service    control plane on :4819
+```
+
+Secrets (gateway API keys, `WEBHOOK_TOKEN`, `GITHUB_TOKEN`, `CURSOR_API_KEY` for a real reviewer) go in `/etc/agentflow/*.env` files referenced by the units, not in the configs.
 
 ## Notes
 
