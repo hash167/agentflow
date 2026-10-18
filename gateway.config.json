@@ -19,8 +19,8 @@
       "name": "demo-tools",
       "transport": {
         "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "tsx", "src/demo-upstream/server.ts"]
+        "command": "go",
+        "args": ["run", "./cmd/demo-upstream"]
       }
     }
   ]

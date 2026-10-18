@@ -1,6 +1,6 @@
 # agent-gateway
 
-A self-hosted **MCP agent gateway** — a lightweight stand-in for AWS AgentCore Gateway that you can run on your own servers. It exposes **one authenticated MCP endpoint** that your agents (Cursor CLI, Cursor Cloud Agents, Temporal activities, anything that speaks MCP over Streamable HTTP) connect to, and it:
+A self-hosted **MCP agent gateway** written in **Go** — a lightweight stand-in for AWS AgentCore Gateway that you can run on your own servers (single static binary, no runtime dependencies). It exposes **one authenticated MCP endpoint** that your agents (Cursor CLI, Cursor Cloud Agents, Temporal activities, anything that speaks MCP over Streamable HTTP) connect to, and it:
 
 - **Aggregates upstream MCP servers** (stdio or HTTP) behind a single URL, namespacing tools as `<upstream>__<tool>`.
 - **Authenticates callers** with per-agent API keys (`Authorization: Bearer <key>`).
@@ -11,22 +11,28 @@ Secrets for upstream servers (API tokens, OAuth headers) live only in the gatewa
 
 ## Run it
 
+Requires Go 1.25+ (older Go toolchains auto-download the right version).
+
 ```bash
-npm install
-npm start            # starts on http://127.0.0.1:4817/mcp with the demo upstream
+go run ./cmd/gateway          # starts on http://127.0.0.1:4817/mcp with the demo upstream
 ```
 
 In a second terminal:
 
 ```bash
-npm run smoke        # end-to-end test: auth, aggregation, policy enforcement
+go run ./cmd/smoke            # end-to-end test: auth, aggregation, policy enforcement
 ```
 
-`npm run dev` starts with file watching, `npm run typecheck` type-checks.
+For deployment, build static binaries:
+
+```bash
+go build -o bin/gateway ./cmd/gateway
+go build -o bin/demo-upstream ./cmd/demo-upstream
+```
 
 ## Configuration
 
-Everything is in `gateway.config.json` (or pass a path: `npm start -- ./my-config.json`). The shipped config uses the bundled `demo-tools` stdio upstream and two dev keys so it works with zero setup:
+Everything is in `gateway.config.json` (or pass a path: `go run ./cmd/gateway ./my-config.json`, or set `GATEWAY_CONFIG`). The shipped config uses the bundled `demo-tools` stdio upstream and two dev keys so it works with zero setup:
 
 ```jsonc
 {
@@ -38,7 +44,7 @@ Everything is in `gateway.config.json` (or pass a path: `npm start -- ./my-confi
     { "name": "code-reviewer", "key": "${GATEWAY_REVIEWER_KEY}", "allow": ["github:get_pull_request", "demo-tools:*"] }
   ],
   "upstreams": [
-    { "name": "demo-tools", "transport": { "type": "stdio", "command": "npx", "args": ["-y", "tsx", "src/demo-upstream/server.ts"] } },
+    { "name": "demo-tools", "transport": { "type": "stdio", "command": "go", "args": ["run", "./cmd/demo-upstream"] } },
     { "name": "github", "transport": { "type": "http", "url": "https://api.githubcopilot.com/mcp/", "headers": { "Authorization": "Bearer ${GITHUB_PAT}" } } }
   ]
 }
@@ -77,15 +83,17 @@ Everything is in `gateway.config.json` (or pass a path: `npm start -- ./my-confi
 ## Layout
 
 ```
-src/index.ts              entrypoint: load config, connect upstreams, listen
-src/gateway.ts            Express app, auth, and the per-principal MCP server
-src/upstreams.ts          upstream MCP client manager (stdio + streamable HTTP)
-src/policy.ts             allow-pattern matching and tool-name namespacing
-src/audit.ts              JSONL audit logger
-src/config.ts             config schema, env substitution, validation
-src/demo-upstream/        bundled demo MCP server (echo, current_time, sha256, generate_uuid)
-scripts/smoke.ts          end-to-end smoke test (auth, policy, round-trip)
+cmd/gateway/              entrypoint: load config, connect upstreams, listen
+cmd/demo-upstream/        bundled demo MCP server (echo, current_time, sha256, generate_uuid)
+cmd/smoke/                end-to-end smoke test (auth, policy, round-trip)
+internal/gateway/         HTTP handler, auth, and the per-principal MCP server
+internal/upstream/        upstream MCP client manager (stdio + streamable HTTP)
+internal/policy/          allow-pattern matching and tool-name namespacing
+internal/audit/           JSONL audit logger
+internal/config/          config schema, env substitution, validation
 ```
+
+Built on the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
 
 ## Notes
 
