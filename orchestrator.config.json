@@ -1,0 +1,19 @@
+{
+  "temporal": {
+    "hostPort": "127.0.0.1:7233",
+    "namespace": "default",
+    "taskQueue": "code-review"
+  },
+  "webhook": {
+    "host": "127.0.0.1",
+    "port": 4819
+  },
+  "review": {
+    "reviewerCommand": ["go", "run", "./cmd/mock-reviewer"],
+    "maxDiffBytes": 300000,
+    "sink": {
+      "type": "file",
+      "dir": "./reviews"
+    }
+  }
+}
