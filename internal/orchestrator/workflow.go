@@ -54,6 +54,7 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		request = drainLatest(request)
 
 		status.Phase = "fetching"
+		status.HeadSHA = request.HeadSHA
 		if request.Diff == "" && request.DiffURL != "" {
 			if err := workflow.ExecuteActivity(activityCtx, activities.FetchDiff, request).
 				Get(ctx, &request.Diff); err != nil {

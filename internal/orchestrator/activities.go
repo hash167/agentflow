@@ -4,20 +4,54 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 )
 
 type Activities struct {
 	Review ReviewConfig
+	Poller PollerConfig
+	// Temporal is used by the poller activities to read per-PR workflow
+	// state and to signal-with-start reviews. Optional otherwise.
+	Temporal  client.Client
+	TaskQueue string
+
+	ghOnce sync.Mutex
+	gh     *GitHubClient
+}
+
+// github returns a shared client (shared so ETags persist across poll runs).
+func (a *Activities) github() (*GitHubClient, error) {
+	token, err := githubTokenFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	a.ghOnce.Lock()
+	defer a.ghOnce.Unlock()
+	if a.gh == nil || a.gh.Token != token {
+		a.gh = NewGitHubClient(a.Review.Sink.APIBase, token)
+	}
+	return a.gh, nil
+}
+
+func (a *Activities) apiBase() string {
+	if a.Review.Sink.APIBase != "" {
+		return strings.TrimRight(a.Review.Sink.APIBase, "/")
+	}
+	return "https://api.github.com"
 }
 
 // FetchDiff downloads the unified diff for a review request.
@@ -26,13 +60,25 @@ func (a *Activities) FetchDiff(ctx context.Context, request ReviewRequest) (stri
 	if err != nil {
 		return "", err
 	}
+	// GitHub API PR URLs need the token and the diff media type.
+	if strings.HasPrefix(request.DiffURL, a.apiBase()+"/") {
+		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Accept", "application/vnd.github.diff")
+	}
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetching diff from %s: HTTP %d", request.DiffURL, response.StatusCode)
+		err := fmt.Errorf("fetching diff from %s: HTTP %d", request.DiffURL, response.StatusCode)
+		switch response.StatusCode {
+		case http.StatusUnauthorized, http.StatusNotFound:
+			return "", temporal.NewNonRetryableApplicationError(err.Error(), "DiffFetchPermanent", nil)
+		}
+		return "", err
 	}
 	limit := int64(a.Review.MaxDiffBytes) + 1
 	body, err := io.ReadAll(io.LimitReader(response.Body, limit))
@@ -99,10 +145,22 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 
 	cmd := exec.CommandContext(ctx, a.Review.ReviewerCommand[0], a.Review.ReviewerCommand[1:]...)
 	cmd.Stdin = bytes.NewReader(input)
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &tailBuffer{buf: &stderr, max: 2048})
 	output, err := cmd.Output()
 	if err != nil {
-		return result, fmt.Errorf("reviewer command failed: %w", err)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && ctx.Err() == nil {
+			switch exitErr.ExitCode() {
+			case ReviewerExitBadInput, ReviewerExitInvalidOutput:
+				// Permanent: retrying the same diff will not fix the input or
+				// the reviewer's configuration, so fail fast.
+				return result, temporal.NewNonRetryableApplicationError(
+					fmt.Sprintf("reviewer exited %d: %s", exitErr.ExitCode(), strings.TrimSpace(stderr.String())),
+					"ReviewerPermanentError", err)
+			}
+		}
+		return result, fmt.Errorf("reviewer command failed: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
 
 	var verdict struct {
@@ -110,7 +168,9 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 		Findings []ReviewFinding `json:"findings"`
 	}
 	if err := json.Unmarshal(output, &verdict); err != nil {
-		return result, fmt.Errorf("reviewer produced invalid JSON: %w (output: %.200s)", err, output)
+		return result, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("reviewer produced invalid JSON: %v (output: %.200s)", err, output),
+			"ReviewerInvalidJSON", err)
 	}
 	result.Summary = verdict.Summary
 	if verdict.Findings != nil {
@@ -143,52 +203,39 @@ func (a *Activities) postToFile(result ReviewResult) error {
 	return os.WriteFile(filepath.Join(a.Review.Sink.Dir, name), append(payload, '\n'), 0o644)
 }
 
-func formatComment(result ReviewResult) string {
-	var b strings.Builder
-	b.WriteString("## Agent code review\n\n")
-	b.WriteString(result.Summary)
-	b.WriteString("\n")
-	for _, finding := range result.Findings {
-		location := finding.File
-		if finding.Line > 0 {
-			location = fmt.Sprintf("%s:%d", finding.File, finding.Line)
-		}
-		fmt.Fprintf(&b, "\n- **%s** `%s` — %s", finding.Severity, location, finding.Message)
+func (a *Activities) postToGitHub(ctx context.Context, result ReviewResult) error {
+	gh, err := a.github()
+	if err != nil {
+		return err
 	}
-	return b.String()
+	url, created, err := gh.UpsertReviewComment(ctx, result.Repo, result.PRNumber, formatComment(result))
+	if err != nil {
+		return asTemporalError(err)
+	}
+	action := "updated"
+	if created {
+		action = "created"
+	}
+	log.Printf("[orchestrator] review comment %s: %s#%d %s", action, result.Repo, result.PRNumber, url)
+	return nil
 }
 
-func (a *Activities) postToGitHub(ctx context.Context, result ReviewResult) error {
-	token := os.Getenv("GITHUB_TOKEN")
-	if token == "" {
-		return fmt.Errorf("github sink requires the GITHUB_TOKEN environment variable")
-	}
-	apiBase := a.Review.Sink.APIBase
-	if apiBase == "" {
-		apiBase = "https://api.github.com"
-	}
-	url := fmt.Sprintf("%s/repos/%s/issues/%d/comments", strings.TrimRight(apiBase, "/"), result.Repo, result.PRNumber)
+// Reviewer exit codes with permanent meaning (see cmd/cursor-reviewer).
+const (
+	ReviewerExitBadInput      = 2
+	ReviewerExitInvalidOutput = 3
+)
 
-	payload, err := json.Marshal(map[string]string{"body": formatComment(result)})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
+// tailBuffer keeps at most max bytes (the latest) for error messages.
+type tailBuffer struct {
+	buf *bytes.Buffer
+	max int
+}
 
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf.Write(p)
+	if extra := t.buf.Len() - t.max; extra > 0 {
+		t.buf.Next(extra)
 	}
-	defer response.Body.Close()
-	if response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
-		return fmt.Errorf("posting review comment: HTTP %d: %s", response.StatusCode, body)
-	}
-	return nil
+	return len(p), nil
 }

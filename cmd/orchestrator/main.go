@@ -27,8 +27,10 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func main() {
+	// "orchestrator trigger-poller" triggers one poller run now (kubectl exec).
+	triggerPoller := len(os.Args) > 1 && os.Args[1] == "trigger-poller"
 	configPath := "./orchestrator.config.json"
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && !triggerPoller {
 		configPath = os.Args[1]
 	} else if env := os.Getenv("ORCHESTRATOR_CONFIG"); env != "" {
 		configPath = env
@@ -47,10 +49,41 @@ func main() {
 	}
 	defer temporalClient.Close()
 
-	activities := &orchestrator.Activities{Review: cfg.Review}
-	reviewWorker := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
+	if triggerPoller {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := temporalClient.ScheduleClient().GetHandle(ctx, cfg.Poller.ScheduleID).Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
+			log.Fatalf("[orchestrator] cannot trigger schedule %s: %v", cfg.Poller.ScheduleID, err)
+		}
+		log.Printf("[orchestrator] triggered schedule %s", cfg.Poller.ScheduleID)
+		return
+	}
+
+	activities := &orchestrator.Activities{
+		Review:    cfg.Review,
+		Poller:    cfg.Poller,
+		Temporal:  temporalClient,
+		TaskQueue: cfg.Temporal.TaskQueue,
+	}
+	workerOptions := orchestrator.WorkerOptions(cfg.Worker)
+	reviewWorker := worker.New(temporalClient, cfg.Temporal.TaskQueue, workerOptions)
 	reviewWorker.RegisterWorkflow(orchestrator.CodeReviewWorkflow)
+	reviewWorker.RegisterWorkflow(orchestrator.PRPollerWorkflow)
 	reviewWorker.RegisterActivity(activities)
+	log.Printf("[orchestrator] worker caps: maxConcurrentActivities=%d maxConcurrentWorkflowTasks=%d (0 = SDK default)",
+		workerOptions.MaxConcurrentActivityExecutionSize, workerOptions.MaxConcurrentWorkflowTaskExecutionSize)
+	log.Printf("[orchestrator] reviewer=%v sink=%s", cfg.Review.ReviewerCommand, cfg.Review.Sink.Type)
+
+	if cfg.Poller.Enabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := orchestrator.EnsurePollerSchedule(ctx, temporalClient, cfg.Poller, cfg.Temporal.TaskQueue); err != nil {
+			log.Fatalf("[orchestrator] cannot ensure poller schedule %s: %v", cfg.Poller.ScheduleID, err)
+		}
+		cancel()
+		log.Printf("[orchestrator] poller schedule %s ensured: every %s, owner=%s, overlap=skip", cfg.Poller.ScheduleID, cfg.Poller.Interval, cfg.Poller.Owner)
+	} else {
+		log.Printf("[orchestrator] poller disabled (poller.enabled=false)")
+	}
 
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- reviewWorker.Run(worker.InterruptCh()) }()

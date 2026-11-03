@@ -6,7 +6,7 @@ package orchestrator
 // ReviewRequest is the input to one review cycle. Either Diff is provided
 // inline or DiffURL points at a unified diff to fetch.
 type ReviewRequest struct {
-	Repo     string `json:"repo"`     // e.g. "alice/widgets"
+	Repo     string `json:"repo"` // e.g. "alice/widgets"
 	PRNumber int    `json:"prNumber"`
 	Title    string `json:"title,omitempty"`
 	HeadSHA  string `json:"headSha,omitempty"`
@@ -33,7 +33,9 @@ type ReviewResult struct {
 
 // Status is returned by the workflow's "status" query.
 type Status struct {
-	Phase      string        `json:"phase"` // "fetching", "reviewing", "posting", "done"
+	Phase string `json:"phase"` // "fetching", "reviewing", "posting", "done"
+	// HeadSHA is the head commit of the cycle in flight (or last finished).
+	HeadSHA    string        `json:"headSha,omitempty"`
 	Reviews    int           `json:"reviews"`
 	LastResult *ReviewResult `json:"lastResult,omitempty"`
 }
