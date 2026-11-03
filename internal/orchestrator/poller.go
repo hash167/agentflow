@@ -43,41 +43,72 @@ func (p PollerConfig) IntervalDuration() (time.Duration, error) {
 
 // PRInfo is one open PR as seen by the poller.
 type PRInfo struct {
-	Repo     string `json:"repo"`
-	PRNumber int    `json:"prNumber"`
-	Title    string `json:"title,omitempty"`
-	HeadSHA  string `json:"headSha"`
-	Draft    bool   `json:"draft,omitempty"`
+	Repo     string   `json:"repo"`
+	PRNumber int      `json:"prNumber"`
+	Title    string   `json:"title,omitempty"`
+	HeadSHA  string   `json:"headSha"`
+	Draft    bool     `json:"draft,omitempty"`
+	Labels   []string `json:"labels,omitempty"`
 }
 
-func (p PRInfo) Key() string { return WorkflowID(p.Repo, p.PRNumber) }
+// ReviewTarget is one (PR, label rule) pair: a PR with both review labels
+// yields two targets, each with its own workflow, model and comment.
+type ReviewTarget struct {
+	PRInfo
+	LabelKey string `json:"labelKey"`
+	Label    string `json:"label"`
+	Model    string `json:"model"`
+}
+
+func (t ReviewTarget) Key() string { return ReviewWorkflowID(t.Repo, t.PRNumber, t.LabelKey) }
+
+// Reviewed is the last (head SHA, model) reviewed or started for a target.
+type Reviewed struct {
+	HeadSHA string `json:"headSha"`
+	Model   string `json:"model"`
+}
 
 // PollSummary is the PRPollerWorkflow result (also logged).
 type PollSummary struct {
 	Repos     []string `json:"repos"`
 	OpenPRs   int      `json:"openPRs"`
+	Unlabeled int      `json:"unlabeled"` // open PRs without a review label (skipped)
+	Targets   int      `json:"targets"`   // (PR, label) pairs considered
 	Triggered []string `json:"triggered"`
 	Unchanged int      `json:"unchanged"`
 }
 
 // ListOpenPRsResult is returned by the ListOpenPRs activity.
 type ListOpenPRsResult struct {
-	Repos []string `json:"repos"`
-	PRs   []PRInfo `json:"prs"`
+	Repos   []string       `json:"repos"`
+	PRs     []PRInfo       `json:"prs"`
+	Targets []ReviewTarget `json:"targets"`
 }
 
-// PRsNeedingReview is the dedupe rule: a PR needs a review only when its
-// current head SHA differs from the last SHA we reviewed (or started).
-func PRsNeedingReview(prs []PRInfo, lastReviewed map[string]string) []PRInfo {
-	var out []PRInfo
+// TargetsForPRs applies label gating: unlabeled PRs produce no targets.
+func TargetsForPRs(prs []PRInfo, rules []LabelRule) []ReviewTarget {
+	out := []ReviewTarget{}
 	for _, pr := range prs {
-		if pr.HeadSHA == "" {
+		for _, r := range MatchLabels(rules, pr.Labels) {
+			out = append(out, ReviewTarget{PRInfo: pr, LabelKey: r.Key, Label: r.Label, Model: r.Model})
+		}
+	}
+	return out
+}
+
+// TargetsNeedingReview is the dedupe rule: a target needs a review only when
+// its (head SHA, model) differs from the last one reviewed or started.
+func TargetsNeedingReview(targets []ReviewTarget, last map[string]Reviewed) []ReviewTarget {
+	var out []ReviewTarget
+	for _, t := range targets {
+		if t.HeadSHA == "" {
 			continue
 		}
-		if last := lastReviewed[pr.Key()]; last != "" && strings.EqualFold(last, pr.HeadSHA) {
+		if prev, ok := last[t.Key()]; ok && prev.HeadSHA != "" &&
+			strings.EqualFold(prev.HeadSHA, t.HeadSHA) && strings.EqualFold(prev.Model, t.Model) {
 			continue
 		}
-		out = append(out, pr)
+		out = append(out, t)
 	}
 	return out
 }
@@ -96,22 +127,27 @@ func PRPollerWorkflow(ctx workflow.Context) (PollSummary, error) {
 	if err := workflow.ExecuteActivity(actx, a.ListOpenPRs).Get(ctx, &listed); err != nil {
 		return PollSummary{}, err
 	}
-	summary := PollSummary{Repos: listed.Repos, OpenPRs: len(listed.PRs), Triggered: []string{}}
-	if len(listed.PRs) > 0 {
-		lastReviewed := map[string]string{}
-		if err := workflow.ExecuteActivity(actx, a.LastReviewedSHAs, listed.PRs).Get(ctx, &lastReviewed); err != nil {
+	summary := PollSummary{Repos: listed.Repos, OpenPRs: len(listed.PRs), Targets: len(listed.Targets), Triggered: []string{}}
+	labelled := map[string]bool{}
+	for _, t := range listed.Targets {
+		labelled[WorkflowID(t.Repo, t.PRNumber)] = true
+	}
+	summary.Unlabeled = len(listed.PRs) - len(labelled)
+	if len(listed.Targets) > 0 {
+		last := map[string]Reviewed{}
+		if err := workflow.ExecuteActivity(actx, a.LastReviewedTargets, listed.Targets).Get(ctx, &last); err != nil {
 			return summary, err
 		}
-		todo := PRsNeedingReview(listed.PRs, lastReviewed)
-		summary.Unchanged = len(listed.PRs) - len(todo)
+		todo := TargetsNeedingReview(listed.Targets, last)
+		summary.Unchanged = len(listed.Targets) - len(todo)
 		if len(todo) > 0 {
-			if err := workflow.ExecuteActivity(actx, a.StartReviews, todo).Get(ctx, &summary.Triggered); err != nil {
+			if err := workflow.ExecuteActivity(actx, a.StartReviewTargets, todo).Get(ctx, &summary.Triggered); err != nil {
 				return summary, err
 			}
 		}
 	}
 	workflow.GetLogger(ctx).Info("pr-poller run",
-		"repos", len(summary.Repos), "openPRs", summary.OpenPRs,
+		"repos", len(summary.Repos), "openPRs", summary.OpenPRs, "unlabeled", summary.Unlabeled, "targets", summary.Targets,
 		"triggered", strings.Join(summary.Triggered, ","), "unchanged", summary.Unchanged)
 	return summary, nil
 }
@@ -142,6 +178,9 @@ type ghPull struct {
 	Head   struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 // ListOpenPRs lists open PRs in the owner's non-archived repos visible to
@@ -195,22 +234,28 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 			if p.Draft && !cfg.IncludeDrafts {
 				continue
 			}
-			result.PRs = append(result.PRs, PRInfo{Repo: repo, PRNumber: p.Number, Title: p.Title, HeadSHA: p.Head.SHA, Draft: p.Draft})
+			labels := []string{}
+			for _, l := range p.Labels {
+				labels = append(labels, l.Name)
+			}
+			result.PRs = append(result.PRs, PRInfo{Repo: repo, PRNumber: p.Number, Title: p.Title, HeadSHA: p.Head.SHA, Draft: p.Draft, Labels: labels})
 		}
 	}
+	result.Targets = TargetsForPRs(result.PRs, a.Review.Labels)
 	return result, nil
 }
 
-// LastReviewedSHAs returns, per PR workflow ID, the head SHA last reviewed
-// or currently under review: first from the per-PR workflow's status query
-// (works for running and closed executions within retention), then from the
-// head SHA embedded in our marker comment.
-func (a *Activities) LastReviewedSHAs(ctx context.Context, prs []PRInfo) (map[string]string, error) {
-	out := map[string]string{}
-	for _, pr := range prs {
-		activity.RecordHeartbeat(ctx, pr.Key())
-		if sha := a.shaFromWorkflow(ctx, pr); sha != "" {
-			out[pr.Key()] = sha
+// LastReviewedTargets returns, per target workflow ID, the (head SHA, model)
+// last reviewed or currently under review: first from the target workflow's
+// status query (running and closed executions within retention), then from
+// the head/model markers in that label's comment. Comments without a model
+// marker (pre-label reviews) do not count, so labelling a PR reviews it.
+func (a *Activities) LastReviewedTargets(ctx context.Context, targets []ReviewTarget) (map[string]Reviewed, error) {
+	out := map[string]Reviewed{}
+	for _, t := range targets {
+		activity.RecordHeartbeat(ctx, t.Key())
+		if r := a.reviewedFromWorkflow(ctx, t.Key()); r.HeadSHA != "" {
+			out[t.Key()] = r
 			continue
 		}
 		if a.Review.Sink.Type == "github" {
@@ -218,13 +263,13 @@ func (a *Activities) LastReviewedSHAs(ctx context.Context, prs []PRInfo) (map[st
 			if err != nil {
 				return nil, err
 			}
-			comment, err := gh.FindReviewComment(ctx, pr.Repo, pr.PRNumber)
+			comment, err := gh.FindReviewComment(ctx, t.Repo, t.PRNumber, MarkerFor(t.LabelKey))
 			if err != nil {
 				return nil, asTemporalError(err)
 			}
 			if comment != nil {
-				if sha := HeadSHAFromComment(comment.Body); sha != "" {
-					out[pr.Key()] = sha
+				if sha, model := HeadSHAFromComment(comment.Body), ModelFromComment(comment.Body); sha != "" && model != "" {
+					out[t.Key()] = Reviewed{HeadSHA: sha, Model: model}
 				}
 			}
 		}
@@ -232,61 +277,70 @@ func (a *Activities) LastReviewedSHAs(ctx context.Context, prs []PRInfo) (map[st
 	return out, nil
 }
 
-func (a *Activities) shaFromWorkflow(ctx context.Context, pr PRInfo) string {
+func (a *Activities) reviewedFromWorkflow(ctx context.Context, workflowID string) Reviewed {
 	if a.Temporal == nil {
-		return ""
+		return Reviewed{}
 	}
 	qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	resp, err := a.Temporal.QueryWorkflow(qctx, pr.Key(), "", QueryStatus)
+	resp, err := a.Temporal.QueryWorkflow(qctx, workflowID, "", QueryStatus)
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if !errors.As(err, &notFound) {
-			activity.GetLogger(ctx).Warn("status query failed", "workflow", pr.Key(), "error", err.Error())
+			activity.GetLogger(ctx).Warn("status query failed", "workflow", workflowID, "error", err.Error())
 		}
-		return ""
+		return Reviewed{}
 	}
 	var status Status
 	if err := resp.Get(&status); err != nil {
-		return ""
+		return Reviewed{}
 	}
 	if status.HeadSHA != "" {
-		return status.HeadSHA
+		return Reviewed{HeadSHA: status.HeadSHA, Model: status.Model}
 	}
 	if status.LastResult != nil {
-		return status.LastResult.HeadSHA
+		return Reviewed{HeadSHA: status.LastResult.HeadSHA, Model: status.LastResult.Model}
 	}
-	return ""
+	return Reviewed{}
 }
 
-// StartReviews signal-with-starts the per-PR review workflow (same ID and
-// request shape as the webhook) with a GitHub API diffUrl.
-func (a *Activities) StartReviews(ctx context.Context, prs []PRInfo) ([]string, error) {
+// StartReviewTargets signal-with-starts one review workflow per target
+// (same request shape as the webhook) with a GitHub API diffUrl.
+func (a *Activities) StartReviewTargets(ctx context.Context, targets []ReviewTarget) ([]string, error) {
 	if a.Temporal == nil {
-		return nil, temporal.NewNonRetryableApplicationError("StartReviews needs a Temporal client", "NoTemporalClient", nil)
+		return nil, temporal.NewNonRetryableApplicationError("StartReviewTargets needs a Temporal client", "NoTemporalClient", nil)
 	}
 	started := []string{}
-	for _, pr := range prs {
+	for _, t := range targets {
 		request := ReviewRequest{
-			Repo:     pr.Repo,
-			PRNumber: pr.PRNumber,
-			Title:    pr.Title,
-			HeadSHA:  pr.HeadSHA,
-			DiffURL:  fmt.Sprintf("%s/repos/%s/pulls/%d", a.apiBase(), pr.Repo, pr.PRNumber),
+			Repo:     t.Repo,
+			PRNumber: t.PRNumber,
+			Title:    t.Title,
+			HeadSHA:  t.HeadSHA,
+			DiffURL:  fmt.Sprintf("%s/repos/%s/pulls/%d", a.apiBase(), t.Repo, t.PRNumber),
+			LabelKey: t.LabelKey,
+			Label:    t.Label,
+			Model:    t.Model,
 		}
-		_, err := a.Temporal.SignalWithStartWorkflow(ctx, pr.Key(), SignalNewPush, request,
-			client.StartWorkflowOptions{
-				ID:                    pr.Key(),
-				TaskQueue:             a.TaskQueue,
-				WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-			},
-			CodeReviewWorkflow, request)
-		if err != nil {
+		if err := StartReview(ctx, a.Temporal, a.TaskQueue, t.Key(), request); err != nil {
 			return started, err
 		}
-		started = append(started, fmt.Sprintf("%s#%d@%.7s", pr.Repo, pr.PRNumber, pr.HeadSHA))
+		started = append(started, fmt.Sprintf("%s#%d:%s@%.7s(%s)", t.Repo, t.PRNumber, t.LabelKey, t.HeadSHA, t.Model))
 	}
 	return started, nil
+}
+
+// StartReview signal-with-starts a review workflow; a running execution gets
+// the request as a new-push signal instead of a duplicate run.
+func StartReview(ctx context.Context, c client.Client, taskQueue, workflowID string, request ReviewRequest) error {
+	_, err := c.SignalWithStartWorkflow(ctx, workflowID, SignalNewPush, request,
+		client.StartWorkflowOptions{
+			ID:                    workflowID,
+			TaskQueue:             taskQueue,
+			WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		},
+		CodeReviewWorkflow, request)
+	return err
 }
 
 // EnsurePollerSchedule creates the poller schedule, or updates it to match

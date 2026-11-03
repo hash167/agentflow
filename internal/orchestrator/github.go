@@ -196,14 +196,15 @@ type issueComment struct {
 	HTMLURL string `json:"html_url"`
 }
 
-// FindReviewComment returns our marker comment on a PR, if any.
-func (c *GitHubClient) FindReviewComment(ctx context.Context, repo string, pr int) (*issueComment, error) {
+// FindReviewComment returns the comment carrying marker on a PR, if any.
+// Markers end in " -->", so the default marker never matches a keyed one.
+func (c *GitHubClient) FindReviewComment(ctx context.Context, repo string, pr int, marker string) (*issueComment, error) {
 	comments, err := getAll[issueComment](ctx, c, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100", repo, pr), "list comments")
 	if err != nil {
 		return nil, err
 	}
 	for i := range comments {
-		if strings.Contains(comments[i].Body, ReviewMarker) {
+		if strings.Contains(comments[i].Body, marker) {
 			return &comments[i], nil
 		}
 	}
@@ -212,8 +213,8 @@ func (c *GitHubClient) FindReviewComment(ctx context.Context, repo string, pr in
 
 // UpsertReviewComment updates our marker comment (PATCH) or creates it
 // (POST). Returns the comment URL and whether it was created.
-func (c *GitHubClient) UpsertReviewComment(ctx context.Context, repo string, pr int, body string) (string, bool, error) {
-	existing, err := c.FindReviewComment(ctx, repo, pr)
+func (c *GitHubClient) UpsertReviewComment(ctx context.Context, repo string, pr int, marker, body string) (string, bool, error) {
+	existing, err := c.FindReviewComment(ctx, repo, pr, marker)
 	if err != nil {
 		return "", false, err
 	}
@@ -243,11 +244,21 @@ func HeadSHAFromComment(body string) string {
 
 func formatComment(result ReviewResult) string {
 	var b strings.Builder
-	b.WriteString(ReviewMarker + "\n")
+	b.WriteString(MarkerFor(result.LabelKey) + "\n")
 	if result.HeadSHA != "" {
 		fmt.Fprintf(&b, "<!-- agentflow-head: %s -->\n", result.HeadSHA)
 	}
-	b.WriteString("## Agent code review\n\n")
+	if result.Model != "" {
+		fmt.Fprintf(&b, "<!-- agentflow-model: %s -->\n", result.Model)
+		fmt.Fprintf(&b, "## Agent code review (`%s`)\n\n", result.Model)
+		if result.Label != "" {
+			fmt.Fprintf(&b, "Model `%s`, requested by label `%s`.\n\n", result.Model, result.Label)
+		} else {
+			fmt.Fprintf(&b, "Model `%s`.\n\n", result.Model)
+		}
+	} else {
+		b.WriteString("## Agent code review\n\n")
+	}
 	if result.HeadSHA != "" {
 		short := result.HeadSHA
 		if len(short) > 12 {

@@ -143,3 +143,14 @@ func TestRunBadInputExits2(t *testing.T) {
 	code, _, _ := runWith(t, bin, "nope")
 	require.Equal(t, ExitBadInput, code)
 }
+
+func TestRunUsesPerReviewModelFromStdin(t *testing.T) {
+	bin, record := fakeAgent(t, `{"type":"result","subtype":"success","is_error":false,"result":"`+"```json\\n{\\\"summary\\\":\\\"fine\\\",\\\"findings\\\":[]}\\n```"+`"}`, 0)
+	input := `{"repo":"o/r","prNumber":1,"title":"t","model":"claude-opus-5-5-high","diff":"+++ b/a.go\n@@ -0,0 +1 @@\n+x"}`
+	code, _, stderr := runWith(t, bin, input)
+	require.Equal(t, ExitOK, code, stderr)
+	rec, err := os.ReadFile(record)
+	require.NoError(t, err)
+	require.Contains(t, string(rec), "--model\nclaude-opus-5-5-high")
+	require.NotContains(t, string(rec), "grok-4.7")
+}

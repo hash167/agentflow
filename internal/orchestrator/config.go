@@ -45,6 +45,13 @@ type ReviewConfig struct {
 	// duration, default "15m"). It must exceed ReviewerTimeout so the
 	// reviewer's own timeout fires first and the activity can report it.
 	ActivityTimeout string `json:"activityTimeout,omitempty"`
+	// Labels gate reviews: only PRs with one of these labels are reviewed,
+	// once per (head SHA, model) per label. Default: agentic-review-default
+	// (default model) and agentic-review-claude (DefaultClaudeModel).
+	Labels []LabelRule `json:"labels,omitempty"`
+	// DefaultModel is the model for rules without one; empty falls back to
+	// $CURSOR_REVIEW_MODEL, then grok-4.7.
+	DefaultModel string `json:"defaultModel,omitempty"`
 }
 
 const (
@@ -131,6 +138,12 @@ func LoadConfig(path string) (*Config, error) {
 	// pod env value that could exceed the activity timeout.
 	cfg.Review.ReviewerTimeout = reviewerTimeout.String()
 	cfg.Review.ActivityTimeout = activityTimeout.String()
+	if cfg.Review.Labels == nil {
+		cfg.Review.Labels = DefaultLabelRules()
+	}
+	if cfg.Review.Labels, err = resolveLabelRules(cfg.Review.Labels, cfg.Review.DefaultModel); err != nil {
+		return nil, err
+	}
 	if cfg.Worker.MaxConcurrentActivities < 0 || cfg.Worker.MaxConcurrentWorkflowTasks < 0 {
 		return nil, fmt.Errorf("worker.maxConcurrentActivities and worker.maxConcurrentWorkflowTasks must be >= 0")
 	}

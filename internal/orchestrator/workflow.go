@@ -79,6 +79,8 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 
 		status.Phase = "fetching"
 		status.HeadSHA = request.HeadSHA
+		status.Model = request.Model
+		status.LabelKey = request.LabelKey
 		if request.Diff == "" && request.DiffURL != "" {
 			if err := workflow.ExecuteActivity(activityCtx, activities.FetchDiff, request).
 				Get(ctx, &request.Diff); err != nil {

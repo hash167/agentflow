@@ -43,7 +43,7 @@ spec:
     spec:
       containers:
         - name: orchestrator
-          image: <your-registry>/agent-gateway:0.2.2
+          image: <your-registry>/agent-gateway:0.2.3
           command: ["/app/orchestrator"]
           ports:
             - containerPort: 4819

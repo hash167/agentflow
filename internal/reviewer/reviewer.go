@@ -34,6 +34,8 @@ type Input struct {
 	PRNumber int    `json:"prNumber"`
 	Title    string `json:"title"`
 	Diff     string `json:"diff"`
+	// Model, when set, overrides CURSOR_REVIEW_MODEL for this review.
+	Model string `json:"model,omitempty"`
 }
 
 type Finding struct {
@@ -314,6 +316,9 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Wri
 	if err := json.Unmarshal(raw, &in); err != nil {
 		logf("invalid input JSON: %v", err)
 		return ExitBadInput
+	}
+	if m := strings.TrimSpace(in.Model); m != "" {
+		cfg.Model = m
 	}
 	if strings.TrimSpace(in.Diff) == "" {
 		logf("input has an empty diff")

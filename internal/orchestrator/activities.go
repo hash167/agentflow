@@ -93,6 +93,7 @@ type reviewerInput struct {
 	PRNumber int    `json:"prNumber"`
 	Title    string `json:"title"`
 	Diff     string `json:"diff"`
+	Model    string `json:"model,omitempty"`
 }
 
 // RunReviewAgent executes the configured reviewer command (the headless agent
@@ -103,6 +104,9 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 		PRNumber: request.PRNumber,
 		HeadSHA:  request.HeadSHA,
 		Findings: []ReviewFinding{},
+		LabelKey: request.LabelKey,
+		Label:    request.Label,
+		Model:    request.Model,
 	}
 
 	if len(request.Diff) > a.Review.MaxDiffBytes {
@@ -138,6 +142,7 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 		PRNumber: request.PRNumber,
 		Title:    request.Title,
 		Diff:     request.Diff,
+		Model:    request.Model,
 	})
 	if err != nil {
 		return result, err
@@ -145,9 +150,17 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 
 	cmd := exec.CommandContext(ctx, a.Review.ReviewerCommand[0], a.Review.ReviewerCommand[1:]...)
 	cmd.Stdin = bytes.NewReader(input)
+	var extraEnv []string
 	if a.Review.ReviewerTimeout != "" {
 		// Config wins over the pod env so one file controls both timeouts.
-		cmd.Env = append(os.Environ(), "CURSOR_REVIEW_TIMEOUT="+a.Review.ReviewerTimeout)
+		extraEnv = append(extraEnv, "CURSOR_REVIEW_TIMEOUT="+a.Review.ReviewerTimeout)
+	}
+	if request.Model != "" {
+		// Per-workflow model (also in the stdin payload).
+		extraEnv = append(extraEnv, "CURSOR_REVIEW_MODEL="+request.Model)
+	}
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = io.MultiWriter(os.Stderr, &tailBuffer{buf: &stderr, max: 2048})
@@ -200,6 +213,9 @@ func (a *Activities) postToFile(result ReviewResult) error {
 		return err
 	}
 	name := fmt.Sprintf("%s-pr%d.json", strings.ReplaceAll(result.Repo, "/", "_"), result.PRNumber)
+	if result.LabelKey != "" {
+		name = fmt.Sprintf("%s-pr%d-%s.json", strings.ReplaceAll(result.Repo, "/", "_"), result.PRNumber, result.LabelKey)
+	}
 	payload, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return err
@@ -212,7 +228,7 @@ func (a *Activities) postToGitHub(ctx context.Context, result ReviewResult) erro
 	if err != nil {
 		return err
 	}
-	url, created, err := gh.UpsertReviewComment(ctx, result.Repo, result.PRNumber, formatComment(result))
+	url, created, err := gh.UpsertReviewComment(ctx, result.Repo, result.PRNumber, MarkerFor(result.LabelKey), formatComment(result))
 	if err != nil {
 		return asTemporalError(err)
 	}
@@ -220,7 +236,7 @@ func (a *Activities) postToGitHub(ctx context.Context, result ReviewResult) erro
 	if created {
 		action = "created"
 	}
-	log.Printf("[orchestrator] review comment %s: %s#%d %s", action, result.Repo, result.PRNumber, url)
+	log.Printf("[orchestrator] review comment %s: %s#%d [%s %s] %s", action, result.Repo, result.PRNumber, result.LabelKey, result.Model, url)
 	return nil
 }
 

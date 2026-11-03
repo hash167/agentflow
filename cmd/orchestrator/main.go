@@ -78,6 +78,9 @@ func main() {
 	log.Printf("[orchestrator] worker caps: maxConcurrentActivities=%d maxConcurrentWorkflowTasks=%d (0 = SDK default)",
 		workerOptions.MaxConcurrentActivityExecutionSize, workerOptions.MaxConcurrentWorkflowTaskExecutionSize)
 	log.Printf("[orchestrator] reviewer=%v sink=%s", cfg.Review.ReviewerCommand, cfg.Review.Sink.Type)
+	for _, rule := range cfg.Review.Labels {
+		log.Printf("[orchestrator] review label %q -> key=%s model=%s", rule.Label, rule.Key, rule.Model)
+	}
 
 	if cfg.Poller.Enabled {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -101,11 +104,17 @@ func main() {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing X-Webhook-Token"})
 			return
 		}
-		var request orchestrator.ReviewRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&request); err != nil {
+		// Same label gating as the poller: "labels" lists the PR's labels and
+		// one review workflow starts per matching review label.
+		var body struct {
+			orchestrator.ReviewRequest
+			Labels []string `json:"labels"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
 			return
 		}
+		request := body.ReviewRequest
 		if request.Repo == "" || request.PRNumber <= 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "repo and prNumber are required"})
 			return
@@ -115,23 +124,25 @@ func main() {
 			return
 		}
 
-		workflowID := orchestrator.WorkflowID(request.Repo, request.PRNumber)
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		run, err := temporalClient.SignalWithStartWorkflow(
-			ctx,
-			workflowID,
-			orchestrator.SignalNewPush,
-			request,
-			client.StartWorkflowOptions{ID: workflowID, TaskQueue: cfg.Temporal.TaskQueue},
-			orchestrator.CodeReviewWorkflow,
-			request,
-		)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "cannot start workflow: " + err.Error()})
+		rules := orchestrator.MatchLabels(cfg.Review.Labels, body.Labels)
+		if len(rules) == 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"skipped": "no review label", "workflowIds": []string{}})
 			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]string{"workflowId": workflowID, "runId": run.GetRunID()})
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		ids := []string{}
+		for _, rule := range rules {
+			req := request
+			req.LabelKey, req.Label, req.Model = rule.Key, rule.Label, rule.Model
+			workflowID := orchestrator.ReviewWorkflowID(req.Repo, req.PRNumber, rule.Key)
+			if err := orchestrator.StartReview(ctx, temporalClient, cfg.Temporal.TaskQueue, workflowID, req); err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "cannot start workflow: " + err.Error(), "workflowIds": ids})
+				return
+			}
+			ids = append(ids, workflowID)
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"workflowIds": ids})
 	})
 
 	mux.HandleFunc("GET /reviews", func(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +154,11 @@ func main() {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		response, err := temporalClient.QueryWorkflow(ctx, orchestrator.WorkflowID(repo, pr), "", orchestrator.QueryStatus)
+		key := r.URL.Query().Get("label") // label key, e.g. "default" or "claude"
+		if key == "" {
+			key = "default"
+		}
+		response, err := temporalClient.QueryWorkflow(ctx, orchestrator.ReviewWorkflowID(repo, pr, key), "", orchestrator.QueryStatus)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 			return

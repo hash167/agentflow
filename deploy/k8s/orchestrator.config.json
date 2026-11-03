@@ -20,7 +20,18 @@
       "type": "github"
     },
     "reviewerTimeout": "12m",
-    "activityTimeout": "15m"
+    "activityTimeout": "15m",
+    "labels": [
+      {
+        "label": "agentic-review-default",
+        "key": "default"
+      },
+      {
+        "label": "agentic-review-claude",
+        "key": "claude",
+        "model": "claude-opus-5-5-high"
+      }
+    ]
   },
   "poller": {
     "enabled": true,

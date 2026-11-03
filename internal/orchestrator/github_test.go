@@ -159,7 +159,7 @@ func TestRateLimited403IsRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 	gh := NewGitHubClient(srv.URL, "tok")
-	_, err := gh.FindReviewComment(context.Background(), "o/r", 8)
+	_, err := gh.FindReviewComment(context.Background(), "o/r", 8, ReviewMarker)
 	var ghErr *GitHubError
 	require.True(t, errors.As(err, &ghErr))
 	require.False(t, ghErr.Permanent())
