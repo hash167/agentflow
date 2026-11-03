@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"go.temporal.io/sdk/worker"
 )
@@ -36,11 +37,47 @@ type ReviewConfig struct {
 	ReviewerCommand []string   `json:"reviewerCommand"`
 	MaxDiffBytes    int        `json:"maxDiffBytes"`
 	Sink            SinkConfig `json:"sink"`
+	// ReviewerTimeout bounds one reviewer subprocess run (Go duration, default
+	// "12m"). LoadConfig always fills it in and the orchestrator passes it to
+	// the reviewer as CURSOR_REVIEW_TIMEOUT, overriding the pod environment.
+	ReviewerTimeout string `json:"reviewerTimeout,omitempty"`
+	// ActivityTimeout is the RunReviewAgent activity StartToClose (Go
+	// duration, default "15m"). It must exceed ReviewerTimeout so the
+	// reviewer's own timeout fires first and the activity can report it.
+	ActivityTimeout string `json:"activityTimeout,omitempty"`
+}
+
+const (
+	DefaultReviewerTimeout = 12 * time.Minute
+	DefaultActivityTimeout = 15 * time.Minute
+	// minTimeoutMargin is how much longer the activity must be than the
+	// reviewer subprocess (startup, diff I/O, process teardown).
+	minTimeoutMargin = time.Minute
+)
+
+// Timeouts returns the parsed reviewer and activity timeouts with defaults.
+func (r ReviewConfig) Timeouts() (reviewer, activity time.Duration, err error) {
+	reviewer, activity = DefaultReviewerTimeout, DefaultActivityTimeout
+	if r.ReviewerTimeout != "" {
+		if reviewer, err = time.ParseDuration(r.ReviewerTimeout); err != nil || reviewer <= 0 {
+			return 0, 0, fmt.Errorf("review.reviewerTimeout %q must be a positive Go duration", r.ReviewerTimeout)
+		}
+	}
+	if r.ActivityTimeout != "" {
+		if activity, err = time.ParseDuration(r.ActivityTimeout); err != nil || activity <= 0 {
+			return 0, 0, fmt.Errorf("review.activityTimeout %q must be a positive Go duration", r.ActivityTimeout)
+		}
+	}
+	if activity < reviewer+minTimeoutMargin {
+		return 0, 0, fmt.Errorf("review.activityTimeout (%s) must be at least %s longer than review.reviewerTimeout (%s)",
+			activity, minTimeoutMargin, reviewer)
+	}
+	return reviewer, activity, nil
 }
 
 // WorkerConfig caps how much work this worker runs at once. Reviews beyond
 // the cap stay queued in Temporal (activity tasks wait on the task queue; the
-// 10m StartToClose clock only starts once a slot picks them up).
+// RunReviewAgent StartToClose clock only starts once a slot picks them up).
 type WorkerConfig struct {
 	// MaxConcurrentActivities bounds concurrently executing activities
 	// (FetchDiff, RunReviewAgent, PostReview, poller activities). Default 4.
@@ -85,6 +122,15 @@ func LoadConfig(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("review.sink.type must be \"file\" or \"github\", got %q", cfg.Review.Sink.Type)
 	}
+	reviewerTimeout, activityTimeout, err := cfg.Review.Timeouts()
+	if err != nil {
+		return nil, err
+	}
+	// Normalize so the effective values are always explicit: the reviewer
+	// subprocess always gets CURSOR_REVIEW_TIMEOUT from config, never a stale
+	// pod env value that could exceed the activity timeout.
+	cfg.Review.ReviewerTimeout = reviewerTimeout.String()
+	cfg.Review.ActivityTimeout = activityTimeout.String()
 	if cfg.Worker.MaxConcurrentActivities < 0 || cfg.Worker.MaxConcurrentWorkflowTasks < 0 {
 		return nil, fmt.Errorf("worker.maxConcurrentActivities and worker.maxConcurrentWorkflowTasks must be >= 0")
 	}

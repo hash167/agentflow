@@ -52,7 +52,7 @@ type Verdict struct {
 type Config struct {
 	AgentBin      string        // CURSOR_AGENT_BIN, default "agent"
 	Model         string        // CURSOR_REVIEW_MODEL, default "grok-4.7"
-	Timeout       time.Duration // CURSOR_REVIEW_TIMEOUT, default 8m (activity StartToClose is 10m)
+	Timeout       time.Duration // CURSOR_REVIEW_TIMEOUT, default 12m (activity StartToClose defaults to 15m)
 	GatewayURL    string        // AGENTFLOW_GATEWAY_URL; empty disables the MCP gateway
 	GatewayKeyEnv string        // name of the env var holding the gateway key (never the value)
 	Mode          string        // CURSOR_REVIEW_MODE: "" (agent, default) | "ask" | "plan"
@@ -61,7 +61,7 @@ type Config struct {
 
 const (
 	DefaultModel      = "grok-4.7"
-	DefaultTimeout    = 8 * time.Minute
+	DefaultTimeout    = 12 * time.Minute
 	DefaultGatewayURL = "http://agent-gateway.agent-gateway.svc.cluster.local/mcp"
 	GatewayKeyEnv     = "GATEWAY_REVIEWER_KEY"
 	MCPServerName     = "agentflow-gateway"

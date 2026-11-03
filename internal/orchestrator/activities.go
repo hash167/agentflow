@@ -145,6 +145,10 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 
 	cmd := exec.CommandContext(ctx, a.Review.ReviewerCommand[0], a.Review.ReviewerCommand[1:]...)
 	cmd.Stdin = bytes.NewReader(input)
+	if a.Review.ReviewerTimeout != "" {
+		// Config wins over the pod env so one file controls both timeouts.
+		cmd.Env = append(os.Environ(), "CURSOR_REVIEW_TIMEOUT="+a.Review.ReviewerTimeout)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = io.MultiWriter(os.Stderr, &tailBuffer{buf: &stderr, max: 2048})
 	output, err := cmd.Output()

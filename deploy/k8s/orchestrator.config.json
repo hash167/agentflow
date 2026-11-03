@@ -18,7 +18,9 @@
     "maxDiffBytes": 300000,
     "sink": {
       "type": "github"
-    }
+    },
+    "reviewerTimeout": "12m",
+    "activityTimeout": "15m"
   },
   "poller": {
     "enabled": true,

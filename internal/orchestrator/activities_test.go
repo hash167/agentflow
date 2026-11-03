@@ -52,3 +52,17 @@ func TestFormatCommentHasMarkerAndSHA(t *testing.T) {
 	require.Equal(t, "0123456789abcdef", HeadSHAFromComment(body))
 	_ = context.Background()
 }
+
+func TestRunReviewAgentPassesConfiguredReviewerTimeout(t *testing.T) {
+	t.Setenv("CURSOR_REVIEW_TIMEOUT", "8m")
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	a := &Activities{Review: ReviewConfig{MaxDiffBytes: 1000, ReviewerTimeout: "12m0s", ReviewerCommand: []string{"sh", "-c",
+		`cat >/dev/null; printf '{"summary":"%s","findings":[]}' "$CURSOR_REVIEW_TIMEOUT"`}}}
+	env.RegisterActivity(a)
+	future, err := env.ExecuteActivity(a.RunReviewAgent, ReviewRequest{Repo: "o/r", PRNumber: 1, Diff: "+x"})
+	require.NoError(t, err)
+	var result ReviewResult
+	require.NoError(t, future.Get(&result))
+	require.Equal(t, "12m0s", result.Summary)
+}

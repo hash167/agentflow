@@ -43,7 +43,7 @@ spec:
     spec:
       containers:
         - name: orchestrator
-          image: <your-registry>/agent-gateway:0.2.1
+          image: <your-registry>/agent-gateway:0.2.2
           command: ["/app/orchestrator"]
           ports:
             - containerPort: 4819
@@ -61,8 +61,10 @@ spec:
               value: http://agent-gateway.agent-gateway.svc.cluster.local/mcp
             - name: CURSOR_REVIEW_MODEL
               value: grok-4.7
+            # Informational: the orchestrator overrides this per run with
+            # review.reviewerTimeout from the config (default 12m).
             - name: CURSOR_REVIEW_TIMEOUT
-              value: 8m
+              value: 12m
           envFrom:
             - secretRef:
                 name: orchestrator-tokens

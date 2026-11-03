@@ -59,6 +59,11 @@ func main() {
 		return
 	}
 
+	_, reviewActivityTimeout, _ := cfg.Review.Timeouts() // validated in LoadConfig
+	orchestrator.SetReviewActivityTimeout(reviewActivityTimeout)
+	log.Printf("[orchestrator] review timeouts: reviewer=%s activity(StartToClose)=%s heartbeat=1m",
+		cfg.Review.ReviewerTimeout, orchestrator.ReviewActivityTimeout())
+
 	activities := &orchestrator.Activities{
 		Review:    cfg.Review,
 		Poller:    cfg.Poller,

@@ -4,7 +4,7 @@
 //
 //	CURSOR_API_KEY          required, used by the Cursor CLI
 //	CURSOR_REVIEW_MODEL     default grok-4.7
-//	CURSOR_REVIEW_TIMEOUT   default 8m (below the activity's 10m StartToClose)
+//	CURSOR_REVIEW_TIMEOUT   default 12m (below the activity's 15m StartToClose)
 //	CURSOR_AGENT_BIN        default "agent"
 //	AGENTFLOW_GATEWAY_URL   MCP gateway URL (default in-cluster service; "-" disables)
 //	GATEWAY_REVIEWER_KEY    gateway bearer key (referenced via ${env:...}, never logged)

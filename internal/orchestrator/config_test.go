@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -47,4 +48,37 @@ func TestPollerConfigValidation(t *testing.T) {
 	require.Equal(t, "15m", cfg.Poller.Interval)
 	require.Equal(t, "hash167", cfg.Poller.Owner)
 	require.False(t, cfg.Poller.IncludeDrafts)
+}
+
+func TestReviewTimeoutDefaults(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"]}}`))
+	require.NoError(t, err)
+	r, a, err := cfg.Review.Timeouts()
+	require.NoError(t, err)
+	require.Equal(t, 12*time.Minute, r)
+	require.Equal(t, 15*time.Minute, a)
+	require.Equal(t, "12m0s", cfg.Review.ReviewerTimeout)
+	require.Equal(t, "15m0s", cfg.Review.ActivityTimeout)
+}
+
+func TestReviewTimeoutsFromConfig(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"],"reviewerTimeout":"20m","activityTimeout":"25m"}}`))
+	require.NoError(t, err)
+	r, a, err := cfg.Review.Timeouts()
+	require.NoError(t, err)
+	require.Equal(t, 20*time.Minute, r)
+	require.Equal(t, 25*time.Minute, a)
+}
+
+func TestReviewTimeoutsRejectActivityNotAboveReviewer(t *testing.T) {
+	for _, body := range []string{
+		`{"review":{"reviewerCommand":["x"],"reviewerTimeout":"15m","activityTimeout":"15m"}}`,
+		`{"review":{"reviewerCommand":["x"],"reviewerTimeout":"20m"}}`,
+		`{"review":{"reviewerCommand":["x"],"activityTimeout":"10m"}}`,
+		`{"review":{"reviewerCommand":["x"],"reviewerTimeout":"soon"}}`,
+		`{"review":{"reviewerCommand":["x"],"activityTimeout":"-5m"}}`,
+	} {
+		_, err := LoadConfig(writeConfig(t, body))
+		require.Error(t, err, body)
+	}
 }
