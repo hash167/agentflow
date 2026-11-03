@@ -1,10 +1,14 @@
 package orchestrator
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/testsuite"
 )
 
@@ -84,4 +88,29 @@ func TestOversizedDiffIsSkippedWithoutRunningReviewer(t *testing.T) {
 	require.NoError(t, future.Get(&result))
 	require.NotEmpty(t, result.Skipped)
 	require.Empty(t, result.Findings)
+}
+
+func TestRunReviewAgentUsesConfiguredStartToClose(t *testing.T) {
+	prev := ReviewActivityTimeout()
+	t.Cleanup(func() { SetReviewActivityTimeout(prev) })
+	SetReviewActivityTimeout(17 * time.Minute)
+
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	activities := &Activities{}
+	env.RegisterActivity(activities)
+
+	request := ReviewRequest{Repo: "alice/widgets", PRNumber: 10, Diff: "+x"}
+	got := map[string]time.Duration{}
+	env.SetOnActivityStartedListener(func(info *activity.Info, _ context.Context, _ converter.EncodedValues) {
+		got[info.ActivityType.Name] = info.Deadline.Sub(info.StartedTime)
+	})
+	env.OnActivity(activities.RunReviewAgent, mock.Anything, request).
+		Return(ReviewResult{Repo: request.Repo, PRNumber: request.PRNumber, Summary: "ok"}, nil).Once()
+	env.OnActivity(activities.PostReview, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(CodeReviewWorkflow, request)
+	require.NoError(t, env.GetWorkflowError())
+	require.Equal(t, 17*time.Minute, got["RunReviewAgent"].Round(time.Second))
+	require.Equal(t, 10*time.Minute, got["PostReview"].Round(time.Second))
 }

@@ -8,12 +8,38 @@
     "host": "0.0.0.0",
     "port": 4819
   },
+  "worker": {
+    "maxConcurrentActivities": 4
+  },
   "review": {
-    "reviewerCommand": ["/app/mock-reviewer"],
+    "reviewerCommand": [
+      "/app/cursor-reviewer"
+    ],
     "maxDiffBytes": 300000,
     "sink": {
-      "type": "file",
-      "dir": "/data/reviews"
-    }
+      "type": "github"
+    },
+    "reviewerTimeout": "12m",
+    "activityTimeout": "15m",
+    "labels": [
+      {
+        "label": "agentic-review-default",
+        "key": "default"
+      },
+      {
+        "label": "agentic-review-claude",
+        "key": "claude",
+        "model": "claude-opus-5-5-high"
+      }
+    ]
+  },
+  "poller": {
+    "enabled": true,
+    "scheduleId": "pr-poller",
+    "interval": "15m",
+    "owner": "hash167",
+    "includeDrafts": true,
+    "repos": [],
+    "excludeRepos": []
   }
 }

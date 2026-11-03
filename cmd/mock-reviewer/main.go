@@ -37,7 +37,7 @@ type verdict struct {
 }
 
 var (
-	hunkRe  = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+	hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 	checks = []struct {
 		pattern  *regexp.Regexp
 		severity string

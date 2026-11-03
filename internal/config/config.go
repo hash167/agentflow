@@ -40,10 +40,10 @@ type APIKey struct {
 }
 
 type Config struct {
-	Host     string     `json:"host"`
-	Port     int        `json:"port"`
-	AuditLog string     `json:"auditLog"`
-	APIKeys  []APIKey   `json:"apiKeys"`
+	Host      string     `json:"host"`
+	Port      int        `json:"port"`
+	AuditLog  string     `json:"auditLog"`
+	APIKeys   []APIKey   `json:"apiKeys"`
 	Upstreams []Upstream `json:"upstreams"`
 }
 

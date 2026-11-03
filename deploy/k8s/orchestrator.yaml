@@ -14,6 +14,11 @@
 #        kubectl -n agent-gateway create secret generic orchestrator-tokens \
 #          --from-literal=WEBHOOK_TOKEN="$(openssl rand -hex 24)" \
 #          --from-literal=GITHUB_TOKEN="<your-pat-or-empty>"
+#      Prefer piping values over stdin so they never land in argv/shell history:
+#        printf '{"stringData":{"CURSOR_API_KEY":"%s"}}' "$KEY" | \
+#          kubectl -n agent-gateway patch secret orchestrator-tokens --type=merge --patch-file=/dev/stdin
+#      (CURSOR_API_KEY runs the cursor-reviewer; GITHUB_TOKEN needs `repo` scope
+#      for diffs, comments and the pr-poller.)
 #   2. kubectl -n agent-gateway create configmap orchestrator-config \
 #        --from-file=config.json=deploy/k8s/orchestrator.config.json
 #   3. Set the image below, then: kubectl apply -f deploy/k8s/orchestrator.yaml
@@ -38,11 +43,28 @@ spec:
     spec:
       containers:
         - name: orchestrator
-          image: <your-registry>/agent-gateway:0.1.0
+          image: <your-registry>/agent-gateway:0.2.3
           command: ["/app/orchestrator"]
           ports:
             - containerPort: 4819
               name: webhook
+          env:
+            # Key the reviewer presents to the in-cluster MCP gateway; referenced
+            # from the gateway's own secret, never copied.
+            - name: GATEWAY_REVIEWER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-keys
+                  key: GATEWAY_REVIEWER_KEY
+                  optional: true
+            - name: AGENTFLOW_GATEWAY_URL
+              value: http://agent-gateway.agent-gateway.svc.cluster.local/mcp
+            - name: CURSOR_REVIEW_MODEL
+              value: grok-4.7
+            # Informational: the orchestrator overrides this per run with
+            # review.reviewerTimeout from the config (default 12m).
+            - name: CURSOR_REVIEW_TIMEOUT
+              value: 12m
           envFrom:
             - secretRef:
                 name: orchestrator-tokens
@@ -67,10 +89,11 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
+              cpu: 100m
               memory: 256Mi
+            limits:
+              # Up to worker.maxConcurrentActivities (4) Cursor CLI processes.
+              memory: 3Gi
       volumes:
         - name: config
           configMap:
@@ -86,6 +109,9 @@ metadata:
   labels:
     app: orchestrator
 spec:
+  # ClusterIP only: no NodePort/LoadBalancer. PRs are discovered by the
+  # pr-poller schedule, so no public webhook is needed.
+  type: ClusterIP
   selector:
     app: orchestrator
   ports:

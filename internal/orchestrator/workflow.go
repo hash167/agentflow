@@ -14,6 +14,24 @@ func WorkflowID(repo string, prNumber int) string {
 	return "review:" + repo + "#" + strconv.Itoa(prNumber)
 }
 
+// reviewActivityTimeout is the RunReviewAgent StartToClose. It is process
+// configuration (review.activityTimeout), set once at worker startup via
+// SetReviewActivityTimeout before the worker starts. Activity timeouts are not
+// part of Temporal's determinism checks, so changing it between deploys is
+// replay-safe.
+var reviewActivityTimeout = DefaultActivityTimeout
+
+// SetReviewActivityTimeout configures the RunReviewAgent StartToClose. Call it
+// before starting the worker; non-positive values keep the default.
+func SetReviewActivityTimeout(d time.Duration) {
+	if d > 0 {
+		reviewActivityTimeout = d
+	}
+}
+
+// ReviewActivityTimeout returns the configured RunReviewAgent StartToClose.
+func ReviewActivityTimeout() time.Duration { return reviewActivityTimeout }
+
 // CodeReviewWorkflow reviews a PR and re-reviews whenever a new push arrives
 // via the SignalNewPush signal while a cycle is in flight.
 func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResult, error) {
@@ -35,7 +53,7 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		}
 	}
 
-	activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+	baseOptions := workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Minute,
 		HeartbeatTimeout:    time.Minute,
 		RetryPolicy: &temporal.RetryPolicy{
@@ -44,7 +62,13 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 			MaximumInterval:    2 * time.Minute,
 			MaximumAttempts:    4,
 		},
-	})
+	}
+	// FetchDiff and PostReview keep 10m; RunReviewAgent gets the configured
+	// (longer) StartToClose so it outlasts the reviewer subprocess timeout.
+	activityCtx := workflow.WithActivityOptions(ctx, baseOptions)
+	reviewOptions := baseOptions
+	reviewOptions.StartToCloseTimeout = reviewActivityTimeout
+	reviewCtx := workflow.WithActivityOptions(ctx, reviewOptions)
 
 	var activities *Activities
 	request := initial
@@ -54,6 +78,9 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		request = drainLatest(request)
 
 		status.Phase = "fetching"
+		status.HeadSHA = request.HeadSHA
+		status.Model = request.Model
+		status.LabelKey = request.LabelKey
 		if request.Diff == "" && request.DiffURL != "" {
 			if err := workflow.ExecuteActivity(activityCtx, activities.FetchDiff, request).
 				Get(ctx, &request.Diff); err != nil {
@@ -62,7 +89,7 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		}
 
 		status.Phase = "reviewing"
-		if err := workflow.ExecuteActivity(activityCtx, activities.RunReviewAgent, request).
+		if err := workflow.ExecuteActivity(reviewCtx, activities.RunReviewAgent, request).
 			Get(ctx, &result); err != nil {
 			return ReviewResult{}, err
 		}
