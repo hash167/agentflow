@@ -73,6 +73,9 @@ spec:
         - name: data
           emptyDir: {}
 ---
+# Internal-only: the MCP gateway is reached via this ClusterIP Service DNS
+# (agent-gateway.agent-gateway.svc.cluster.local). Do not add a NodePort or
+# LoadBalancer; the old agent-gateway-nodeport (30803) was removed 2026-11-03.
 apiVersion: v1
 kind: Service
 metadata:

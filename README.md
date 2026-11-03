@@ -173,7 +173,7 @@ kubectl -n agent-gateway create secret generic orchestrator-tokens \
 kubectl apply -f deploy/k8s/orchestrator.yaml
 ```
 
-Point your forge's PR webhook at the orchestrator Service (`/hooks/pr`, with the `X-Webhook-Token` header). Both container configs bind 0.0.0.0, read secrets from env, write runtime data to an `emptyDir` at `/data`, and expose `/healthz` for probes. Services are ClusterIP; expose them on your tailnet with the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator) or an ingress of your choice.
+Point your forge's PR webhook at the orchestrator Service (`/hooks/pr`, with the `X-Webhook-Token` header). Both container configs bind 0.0.0.0, read secrets from env, write runtime data to an `emptyDir` at `/data`, and expose `/healthz` for probes. Services are ClusterIP (the MCP gateway is internal-only; the reviewer reaches it at `http://agent-gateway.agent-gateway.svc.cluster.local/mcp`); expose the orchestrator on your tailnet with the [Tailscale Kubernetes operator](https://tailscale.com/kb/1236/kubernetes-operator) or an ingress of your choice.
 
 ### Option 2: systemd on a plain server (`deploy/systemd/`)
 
