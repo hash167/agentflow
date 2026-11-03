@@ -8,12 +8,25 @@
     "host": "0.0.0.0",
     "port": 4819
   },
+  "worker": {
+    "maxConcurrentActivities": 4
+  },
   "review": {
-    "reviewerCommand": ["/app/mock-reviewer"],
+    "reviewerCommand": [
+      "/app/cursor-reviewer"
+    ],
     "maxDiffBytes": 300000,
     "sink": {
-      "type": "file",
-      "dir": "/data/reviews"
+      "type": "github"
     }
+  },
+  "poller": {
+    "enabled": true,
+    "scheduleId": "pr-poller",
+    "interval": "15m",
+    "owner": "hash167",
+    "includeDrafts": true,
+    "repos": [],
+    "excludeRepos": []
   }
 }
