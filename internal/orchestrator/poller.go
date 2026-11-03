@@ -183,7 +183,9 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 		pulls, err := getAll[ghPull](ctx, gh, fmt.Sprintf("/repos/%s/pulls?state=open&per_page=100", repo), "list pulls")
 		if err != nil {
 			var ghErr *GitHubError
-			if errors.As(err, &ghErr) && ghErr.Permanent() {
+			// Any non-rate-limit 4xx (no access, empty/blocked repo...) only
+			// skips that repo; it must not fail the whole poll.
+			if errors.As(err, &ghErr) && !ghErr.RateLimited && ghErr.Status >= 400 && ghErr.Status < 500 {
 				activity.GetLogger(ctx).Warn("skipping repo", "repo", repo, "error", err.Error())
 				continue
 			}
