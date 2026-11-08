@@ -94,12 +94,24 @@ type WorkerConfig struct {
 	MaxConcurrentWorkflowTasks int `json:"maxConcurrentWorkflowTasks"`
 }
 
+// TracingConfig is optional. Export stays off unless an OTLP endpoint is set
+// via tracing.otlpEndpoint or OTEL_EXPORTER_OTLP_ENDPOINT. Missing/empty is
+// a no-op (backward compatible).
+type TracingConfig struct {
+	Enabled      bool   `json:"enabled,omitempty"`
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+	Protocol     string `json:"protocol,omitempty"` // http/protobuf (default) or grpc
+	Environment  string `json:"environment,omitempty"`
+	RunKind      string `json:"runKind,omitempty"` // prod|eval
+}
+
 type Config struct {
 	Temporal TemporalConfig `json:"temporal"`
 	Webhook  WebhookConfig  `json:"webhook"`
 	Review   ReviewConfig   `json:"review"`
 	Worker   WorkerConfig   `json:"worker"`
 	Poller   PollerConfig   `json:"poller"`
+	Tracing  TracingConfig  `json:"tracing"`
 }
 
 func LoadConfig(path string) (*Config, error) {

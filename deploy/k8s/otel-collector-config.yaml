@@ -1,0 +1,80 @@
+# OpenTelemetry Collector config for AgentFlow → Honeycomb (test environment).
+#
+# Apply:
+#   kubectl -n agent-gateway create secret generic honeycomb \
+#     --from-literal=HONEYCOMB_API_KEY='<test-environment-ingest-key>'
+#   kubectl -n agent-gateway apply -f deploy/k8s/otel-collector-config.yaml
+#   kubectl -n agent-gateway apply -f deploy/k8s/otel-collector.yaml
+#
+# Never put ingest keys in this file. The collector is the only process that
+# talks to Honeycomb; app pods only see the in-cluster OTLP endpoint.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: agent-gateway
+  labels:
+    app: otel-collector
+data:
+  relay.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 256
+        spike_limit_mib: 64
+      redaction:
+        allow_all_keys: true
+        blocked_key_patterns:
+          - "(?i).*authorization.*"
+          - "(?i).*token.*"
+          - "(?i).*api[_-]?key.*"
+          - "(?i).*secret.*"
+          - "(?i).*password.*"
+          - "(?i).*cookie.*"
+          - "(?i).*credential.*"
+          - "(?i).*raw[_-]?diff.*"
+          - "(?i).*prompt.*"
+          - "(?i).*webhook[_-]?body.*"
+          - "(?i).*tool[_-]?args.*"
+          - "(?i).*tool[_-]?result.*"
+        blocked_values:
+          - "ghp_[A-Za-z0-9_]{8,}"
+          - "gho_[A-Za-z0-9_]{8,}"
+          - "github_pat_[A-Za-z0-9_]{8,}"
+          - "crsr_[A-Za-z0-9_\\-]{8,}"
+          - "(?i)bearer\\s+[A-Za-z0-9._\\-+/=]{8,}"
+      attributes:
+        actions:
+          - key: http.request.body
+            action: delete
+          - key: http.response.body
+            action: delete
+      batch:
+        timeout: 2s
+        send_batch_size: 256
+    exporters:
+      otlp/honeycomb:
+        endpoint: api.honeycomb.io:443
+        headers:
+          x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, redaction, attributes, batch]
+          exporters: [otlp/honeycomb]
+      telemetry:
+        logs:
+          level: info

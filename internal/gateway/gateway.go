@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
 
 	"agent-gateway/internal/audit"
 	"agent-gateway/internal/config"
 	"agent-gateway/internal/policy"
+	"agent-gateway/internal/telemetry"
 	"agent-gateway/internal/upstream"
 )
 
@@ -58,6 +60,16 @@ func buildMCPServer(
 							Upstream:  up,
 							Tool:      tool,
 						})
+						_, span := telemetry.Start(ctx, telemetry.SpanExecuteTool,
+							attribute.String(telemetry.AttrGenAIOp, "execute_tool"),
+							attribute.String(telemetry.AttrToolName, params.Name),
+							attribute.String(telemetry.AttrGatewayUpstream, up),
+							attribute.String(telemetry.AttrGatewayPrincipal, principal.Name),
+							attribute.String(telemetry.AttrGatewayPolicy, "denied"),
+							attribute.Bool(telemetry.AttrToolOK, false),
+						)
+						telemetry.SetOutcome(span, telemetry.OutcomeFailed, telemetry.ClassGatewayPolicy, "")
+						span.End()
 						return denialResult(fmt.Sprintf(
 							"Tool %q is not allowed for API key %q", params.Name, principal.Name,
 						)), nil
@@ -85,8 +97,21 @@ func buildMCPServer(
 			},
 			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				started := time.Now()
+				toolFull := policy.GatewayToolName(upstreamName, toolName)
+				ctx, span := telemetry.Start(ctx, telemetry.SpanExecuteTool,
+					attribute.String(telemetry.AttrGenAIOp, "execute_tool"),
+					attribute.String(telemetry.AttrToolName, toolFull),
+					attribute.String(telemetry.AttrGatewayUpstream, upstreamName),
+					attribute.String(telemetry.AttrGatewayPrincipal, principal.Name),
+					attribute.String(telemetry.AttrGatewayPolicy, "allowed"),
+				)
+				_, upSpan := telemetry.Start(ctx, telemetry.SpanGatewayUpstream,
+					attribute.String(telemetry.AttrGatewayUpstream, upstreamName),
+					attribute.String(telemetry.AttrToolName, toolName),
+				)
 				result, err := upstreams.CallTool(ctx, upstreamName, toolName, req.Params.Arguments)
 				durationMs := time.Since(started).Milliseconds()
+				span.SetAttributes(attribute.Int64(telemetry.AttrToolDurationMS, durationMs))
 				if err != nil {
 					auditLog.Log(audit.Entry{
 						Event:      audit.EventToolCall,
@@ -95,18 +120,26 @@ func buildMCPServer(
 						Tool:       toolName,
 						OK:         audit.Bool(false),
 						DurationMs: audit.Int64(durationMs),
-						Error:      err.Error(),
+						Error:      telemetry.SafeMessage(err.Error()),
 					})
-					return denialResult("Upstream error: " + err.Error()), nil
+					span.SetAttributes(attribute.Bool(telemetry.AttrToolOK, false))
+					telemetry.End(upSpan, err, "")
+					telemetry.End(span, err, "")
+					return denialResult("Upstream error"), nil
 				}
+				ok := !result.IsError
 				auditLog.Log(audit.Entry{
 					Event:      audit.EventToolCall,
 					Principal:  principal.Name,
 					Upstream:   upstreamName,
 					Tool:       toolName,
-					OK:         audit.Bool(!result.IsError),
+					OK:         audit.Bool(ok),
 					DurationMs: audit.Int64(durationMs),
 				})
+				span.SetAttributes(attribute.Bool(telemetry.AttrToolOK, ok))
+				upSpan.SetAttributes(attribute.Bool(telemetry.AttrToolOK, ok))
+				telemetry.End(upSpan, nil, "")
+				telemetry.End(span, nil, "")
 				return result, nil
 			},
 		)
@@ -141,6 +174,13 @@ func NewHandler(cfg *config.Config, upstreams *upstream.Manager, auditLog *audit
 		principal := keysByValue[token]
 		if !hasBearer || principal == nil {
 			auditLog.Log(audit.Entry{Event: audit.EventAuthFailed})
+			_, span := telemetry.Start(r.Context(), telemetry.SpanExecuteTool,
+				attribute.String(telemetry.AttrGenAIOp, "execute_tool"),
+				attribute.String(telemetry.AttrGatewayPolicy, "auth_failed"),
+				attribute.Bool(telemetry.AttrToolOK, false),
+			)
+			telemetry.SetOutcome(span, telemetry.OutcomeFailed, telemetry.ClassGatewayAuth, "")
+			span.End()
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"jsonrpc": "2.0",
 				"error":   map[string]any{"code": -32001, "message": "Unauthorized: provide Authorization: Bearer <api-key>"},

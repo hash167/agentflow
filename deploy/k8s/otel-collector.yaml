@@ -1,0 +1,88 @@
+# In-cluster OTLP collector. Apps export here; this pod forwards to Honeycomb
+# using the ingest key in secret/honeycomb (test environment).
+#
+#   kubectl -n agent-gateway create secret generic honeycomb \
+#     --from-literal=HONEYCOMB_API_KEY='<PLACEHOLDER_TEST_INGEST_KEY>'
+#   kubectl apply -f deploy/k8s/otel-collector-config.yaml -f deploy/k8s/otel-collector.yaml
+#
+# Rollback: kubectl -n agent-gateway delete -f deploy/k8s/otel-collector.yaml
+# Then remove OTEL_EXPORTER_OTLP_ENDPOINT from orchestrator/gateway env
+# (or set AGENTFLOW_TRACING=0) and restart those deployments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: agent-gateway
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.136.0
+          args: ["--config=/etc/otel/relay.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+          env:
+            - name: HONEYCOMB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: honeycomb
+                  key: HONEYCOMB_API_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: agent-gateway
+  labels:
+    app: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

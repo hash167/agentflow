@@ -17,6 +17,16 @@ type ReviewRequest struct {
 	LabelKey string `json:"labelKey,omitempty"`
 	Label    string `json:"label,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// Forge is "github" (default) or "origin". Used as a correlation attribute
+	// only; this branch's poller talks to GitHub.
+	Forge string `json:"forge,omitempty"`
+	// RunKind is prod (default) or eval. Eval comment posting is a separate
+	// change; traces still stamp the kind when callers set it.
+	RunKind string `json:"runKind,omitempty"`
+	// TraceLink is a W3C traceparent for the poller/webhook span that started
+	// this cycle. Activities add an OTel link; it is never used as a parent
+	// (the poller must not own the review trace).
+	TraceLink string `json:"traceLink,omitempty"`
 }
 
 type ReviewFinding struct {

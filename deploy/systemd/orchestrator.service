@@ -17,7 +17,8 @@ WorkingDirectory=/opt/agentflow
 ExecStart=/opt/agentflow/orchestrator /opt/agentflow/orchestrator.config.json
 Restart=on-failure
 RestartSec=5
-# Put WEBHOOK_TOKEN / GITHUB_TOKEN / CURSOR_API_KEY here (chmod 600):
+# Put WEBHOOK_TOKEN / GITHUB_TOKEN / CURSOR_API_KEY here (chmod 600).
+# Optional tracing: OTEL_EXPORTER_OTLP_ENDPOINT, AGENTFLOW_ENVIRONMENT (see docs/tracing.md).
 EnvironmentFile=-/etc/agentflow/orchestrator.env
 NoNewPrivileges=true
 ProtectSystem=strict

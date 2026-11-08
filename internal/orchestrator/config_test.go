@@ -15,6 +15,21 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestTracingConfigDefaultsOff(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"]}}`))
+	require.NoError(t, err)
+	require.False(t, cfg.Tracing.Enabled)
+	require.Empty(t, cfg.Tracing.OTLPEndpoint)
+}
+
+func TestTracingConfigFromFile(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"]},"tracing":{"enabled":true,"otlpEndpoint":"http://otel-collector:4318","environment":"test","runKind":"prod"}}`))
+	require.NoError(t, err)
+	require.True(t, cfg.Tracing.Enabled)
+	require.Equal(t, "http://otel-collector:4318", cfg.Tracing.OTLPEndpoint)
+	require.Equal(t, "test", cfg.Tracing.Environment)
+}
+
 func TestWorkerOptionsDefaultCap(t *testing.T) {
 	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["/app/mock-reviewer"]}}`))
 	require.NoError(t, err)

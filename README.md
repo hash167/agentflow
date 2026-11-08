@@ -137,6 +137,8 @@ How it behaves:
 
 Configuration lives in `orchestrator.config.json` (Temporal host/namespace/task queue, webhook host/port, review settings). Tests: `go test ./...` exercises the workflow against Temporal's test suite.
 
+**Tracing** (optional, no-op by default): OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT` through an in-cluster collector to Honeycomb. See [docs/tracing.md](docs/tracing.md) for span names, the last-poll query, activation, and rollback. Do not put ingest keys in app configs.
+
 ## Deployment
 
 One multi-stage `Dockerfile` builds all four static binaries into a single distroless image (gateway is the entrypoint; the orchestrator deployment overrides `command`). Two supported paths:
