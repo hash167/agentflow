@@ -196,6 +196,31 @@ type issueComment struct {
 	HTMLURL string `json:"html_url"`
 }
 
+// GetPull fetches one pull request. The state is "open" or "closed".
+func (c *GitHubClient) GetPull(ctx context.Context, repo string, pr int) (PRInfo, string, error) {
+	data, _, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repo, pr), "", nil, "get pull")
+	if err != nil {
+		return PRInfo{}, "", err
+	}
+	var detail ghPull
+	if err := json.Unmarshal(data, &detail); err != nil {
+		return PRInfo{}, "", fmt.Errorf("github get pull: decoding: %w", err)
+	}
+	labels := make([]string, 0, len(detail.Labels))
+	for _, label := range detail.Labels {
+		labels = append(labels, label.Name)
+	}
+	var state struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(data, &state)
+	info := PRInfo{Repo: repo, PRNumber: detail.Number, Title: detail.Title, HeadSHA: detail.Head.SHA, Draft: detail.Draft, Labels: labels}
+	if info.PRNumber == 0 {
+		info.PRNumber = pr
+	}
+	return info, state.State, nil
+}
+
 // FindReviewComment returns the comment carrying marker on a PR, if any.
 // Markers end in " -->", so the default marker never matches a keyed one.
 func (c *GitHubClient) FindReviewComment(ctx context.Context, repo string, pr int, marker string) (*issueComment, error) {

@@ -39,19 +39,20 @@ func TestTargetsNeedingReviewDedupesBySHAAndModel(t *testing.T) {
 	targets := []ReviewTarget{def, cl, noSHA}
 
 	// Nothing reviewed yet: both labels of the PR are reviewed (first seen).
-	require.Equal(t, []ReviewTarget{def, cl}, TargetsNeedingReview(targets, nil))
+	require.Equal(t, []ReviewTarget{def, cl}, TargetsNeedingReview(targets, nil, 500_000))
 	// Same SHA+model for default; claude only reviewed under another model.
+	// A larger budget does not repeat a successful review.
 	last := map[string]Reviewed{
 		def.Key(): {HeadSHA: "AAA", Model: "GROK-4.7"},
 		cl.Key():  {HeadSHA: "aaa", Model: "claude-opus-5-high"},
 	}
-	require.Equal(t, []ReviewTarget{cl}, TargetsNeedingReview(targets, last))
+	require.Equal(t, []ReviewTarget{cl}, TargetsNeedingReview(targets, last, 500_000))
 	// New push: both re-reviewed.
 	last[cl.Key()] = Reviewed{HeadSHA: "aaa", Model: "claude-opus-5-5-high"}
-	require.Empty(t, TargetsNeedingReview(targets, last))
+	require.Empty(t, TargetsNeedingReview(targets, last, 500_000))
 	pushed := []ReviewTarget{def, cl}
 	pushed[0].HeadSHA, pushed[1].HeadSHA = "bbb", "bbb"
-	require.Len(t, TargetsNeedingReview(pushed, last), 2)
+	require.Len(t, TargetsNeedingReview(pushed, last, 300_000), 2)
 }
 
 func runPoller(t *testing.T, listed ListOpenPRsResult, last map[string]Reviewed, expectStart []ReviewTarget) PollSummary {
@@ -103,6 +104,43 @@ func TestPRPollerReviewsOnlyLabelledNewSHAsThenIdles(t *testing.T) {
 	}, nil)
 	require.Empty(t, second.Triggered)
 	require.Equal(t, 2, second.Unchanged)
+}
+
+func TestPRPollerRetriesBudgetSkipOnlyWhenBudgetIncreases(t *testing.T) {
+	pr := PRInfo{Repo: "o/a", PRNumber: 10, HeadSHA: "f6781876f495fef29a49586a6cd96a328f334303", Labels: []string{LabelDefault}}
+	listed := ListOpenPRsResult{Repos: []string{pr.Repo}, PRs: []PRInfo{pr}, Targets: TargetsForPRs([]PRInfo{pr}, testRules)}
+	require.Len(t, listed.Targets, 1)
+	skipped := map[string]Reviewed{
+		listed.Targets[0].Key(): {HeadSHA: pr.HeadSHA, Model: "grok-4.7", SkipBudget: 300_000, Phase: "done"},
+	}
+
+	same := listed
+	same.MaxDiffBytes = 300_000
+	held := runPoller(t, same, skipped, nil)
+	require.Empty(t, held.Triggered)
+	require.Equal(t, 1, held.Unchanged)
+
+	raised := listed
+	raised.MaxDiffBytes = 500_000
+	retried := runPoller(t, raised, skipped, listed.Targets)
+	require.Equal(t, []string{listed.Targets[0].Key()}, retried.Triggered)
+	require.Equal(t, 0, retried.Unchanged)
+}
+
+func TestPRPollerDoesNotRetryRunningOrSuccessfulReviews(t *testing.T) {
+	pr := PRInfo{Repo: "o/a", PRNumber: 10, HeadSHA: "abc", Labels: []string{LabelDefault}}
+	listed := ListOpenPRsResult{
+		Repos: []string{pr.Repo}, PRs: []PRInfo{pr}, Targets: TargetsForPRs([]PRInfo{pr}, testRules), MaxDiffBytes: 500_000,
+	}
+	running := runPoller(t, listed, map[string]Reviewed{
+		listed.Targets[0].Key(): {HeadSHA: pr.HeadSHA, Model: "grok-4.7", Phase: "reviewing", SkipBudget: 300_000},
+	}, nil)
+	require.Empty(t, running.Triggered)
+
+	success := runPoller(t, listed, map[string]Reviewed{
+		listed.Targets[0].Key(): {HeadSHA: pr.HeadSHA, Model: "grok-4.7", Phase: "done"},
+	}, nil)
+	require.Empty(t, success.Triggered)
 }
 
 func TestPRPollerUnlabeledPRsAreNoOp(t *testing.T) {

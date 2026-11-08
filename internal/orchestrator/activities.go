@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -108,6 +110,30 @@ func diffOverBudget(diff string, maxDiffBytes int) string {
 		return fmt.Sprintf("diff exceeds the %d byte budget (read %d bytes, the fetch cap; full size may be larger; truncated diff not reviewed)", maxDiffBytes, n)
 	}
 	return fmt.Sprintf("diff is %d bytes, over the %d byte budget", n, maxDiffBytes)
+}
+
+// budgetSkipPatterns match the budget number embedded in diffOverBudget and in
+// comments posted by older builds ("over the N byte budget").
+var budgetSkipPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`over the ([0-9]+) byte budget`),
+	regexp.MustCompile(`exceeds the ([0-9]+) byte budget`),
+}
+
+// budgetSkipLimit returns the maxDiffBytes that produced a diff-budget skip,
+// or 0 when text is not one. Other skip reasons, including an empty diff,
+// return 0.
+func budgetSkipLimit(text string) int {
+	for _, re := range budgetSkipPatterns {
+		m := re.FindStringSubmatch(text)
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 type reviewerInput struct {

@@ -26,6 +26,11 @@
 #      replace ConfigMap orchestrator-config and restart this Deployment.
 #      Leave worker.maxConcurrentActivities and the 12m/15m timeouts alone.
 #      No env var overrides the byte budget.
+#   A manual poll is `orchestrator trigger-poller` inside this container
+#   (overlap Skip). `trigger-poller retry-skipped owner/repo pr full-sha`
+#   retries one finished diff-budget skip after the budget has increased.
+#   Neither command calls the webhook. A finished skip is retried by the
+#   poller only once the image contains that logic.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

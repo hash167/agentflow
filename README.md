@@ -132,14 +132,33 @@ How it behaves:
 - **Pluggable sink**: `review.sink.type` is `file` (JSON per PR under `reviews/`) or `github` (requires `GITHUB_TOKEN`). The GitHub sink keeps **one comment per PR**, found by the `<!-- agentflow-review -->` marker and PATCHed in place on retries and new pushes; the comment carries the reviewed head SHA. GitHub 401/403/404/422 (not rate limits) are non-retryable.
 - **Concurrency**: `worker.maxConcurrentActivities` (default 4) caps concurrent activities per worker pod, so at most 4 Cursor CLI processes run at once; extra PRs queue in Temporal. Scale out by adding replicas.
 - **Label-gated reviews**: only PRs carrying a review label are reviewed (`review.labels`; default `agentic-review-default` -> the default model `grok-4.7` / `$CURSOR_REVIEW_MODEL` / `review.defaultModel`, and `agentic-review-claude` -> `claude-opus-5-5-high`; `$CURSOR_REVIEW_MODEL_<KEY>` overrides a rule's model). Unlabeled PRs are skipped. Each (PR, label) pair has its own workflow `review:<repo>#<n>:<key>`, its own upserted comment (the default label uses `<!-- agentflow-review -->`, others `<!-- agentflow-review:<key> -->`) that names the model (`<!-- agentflow-model: ... -->`), and is reviewed once per (head SHA, model): when the label is first seen and on each new push while it stays. The model is passed per workflow to the reviewer (stdin `model` and `CURSOR_REVIEW_MODEL`). The webhook applies the same gating via a `labels` array in the body. With the 15m poll interval, a newly added label is picked up within ~15 minutes.
-- **PR poller** (no public webhook needed): with `poller.enabled`, the orchestrator idempotently creates the Temporal Schedule `poller.scheduleId` (default `pr-poller`, every `poller.interval` = 15m, overlap Skip) running `PRPollerWorkflow`. It lists open PRs for `poller.owner` (all non-archived repos, filtered by `poller.repos` / `poller.excludeRepos`; drafts included unless `includeDrafts` is false), and signal-with-starts a review per review label only when the (head SHA, model) differs from the last reviewed one (workflow status/result, falling back to that label's marker comment). Uses ETags and stops when the GitHub rate limit runs low. Trigger once by hand: `orchestrator trigger-poller`.
+- **PR poller** (outbound only; no public webhook needed): with `poller.enabled`, the orchestrator idempotently creates the Temporal Schedule `poller.scheduleId` (default `pr-poller`, every `poller.interval` = 15m, overlap Skip) running `PRPollerWorkflow`. It lists open PRs for `poller.owner` (all non-archived repos, filtered by `poller.repos` / `poller.excludeRepos`; drafts included unless `includeDrafts` is false), and signal-with-starts a review per review label only when the (head SHA, model) differs from the last reviewed one (workflow status query, including a closed run still in retention, then that label's marker comment). A finished **diff-budget skip** of the same head and model is queued again only when `review.maxDiffBytes` is strictly greater than the budget recorded in that skip. The same budget is not retried on later polls. An in-progress review and a successful review are not repeated because the budget changed. Uses ETags and stops when the GitHub rate limit runs low.
 - Set `WEBHOOK_TOKEN` to require an `X-Webhook-Token` header on the webhook; leave it unset only on localhost.
 
 Configuration lives in `orchestrator.config.json` (Temporal host/namespace/task queue, webhook host/port, review settings). Tests: `go test ./...` exercises the workflow against Temporal's test suite.
 
 Which file loads: a CLI path argument, otherwise `ORCHESTRATOR_CONFIG`, otherwise `./orchestrator.config.json`. Inside that file, an explicit `review.maxDiffBytes` replaces the compiled default of 500000 (used only when the key is omitted). The shipped root config and `deploy/k8s/orchestrator.config.json` both set 500000. `ORCHESTRATOR_CONFIG` and `/etc/agentflow/orchestrator.env` (tokens such as `GITHUB_TOKEN` and `CURSOR_API_KEY`) do not change the byte count.
 
-The Kubernetes pod reads ConfigMap `orchestrator-config` key `config.json` at `/etc/orchestrator/config.json` (the image sets `ORCHESTRATOR_CONFIG`) once, at startup. Replacing the ConfigMap and restarting the orchestrator Deployment applies a new budget. The worker already enforces whatever number is in that file, so an image rebuild is required only for code changes such as the fetch-cap skip wording. Worker concurrency (default 4) and the 12m reviewer / 15m activity timeouts are separate settings and stay put.
+The Kubernetes pod reads ConfigMap `orchestrator-config` key `config.json` at `/etc/orchestrator/config.json` (the image sets `ORCHESTRATOR_CONFIG`) once, at startup. Replacing the ConfigMap and restarting the orchestrator Deployment applies a new `review.maxDiffBytes` to fetches made by the **running** binary. Retrying a skip that already finished, and the operator commands below, are code in the orchestrator binary: they take effect only after an image built from this commit is running. Worker concurrency (default 4), the 12m reviewer / 15m activity timeouts, label rules, and the allowlist are separate settings and stay put.
+
+### Operator: kick one poll
+
+Manual runs go through the poller schedule. They do not call `/hooks/pr`.
+
+```bash
+kubectl -n agent-gateway exec deploy/orchestrator -- /app/orchestrator trigger-poller
+```
+
+That triggers schedule `pr-poller` with overlap **Skip**. The command prints JSON and exits 0 for `accepted` (a poll started) or `running` (one is already in progress, including a trigger that coalesced onto it; nothing new was started). Exit 2 is `skipped` (the schedule is paused, or a trigger coalesced without a poll still running). Exit 1 is `error`. The poll that starts is a normal poll: allowlist, labels, models, and the dedupe rules above, including a one-time budget-skip retry when the loaded budget is higher.
+
+To retry one previously skipped pull without waiting for the interval, name the repo, the PR, and that PR's **current** 40-character head:
+
+```bash
+kubectl -n agent-gateway exec deploy/orchestrator -- \
+  /app/orchestrator trigger-poller retry-skipped owner/repo PR_NUMBER FULL_HEAD_SHA
+```
+
+This still uses the poller's GitHub credential, allowlist, draft setting, and label rules. It starts a review only for a label whose latest finished result for that exact head and model was a diff-budget skip, and only when the loaded `review.maxDiffBytes` is greater than the budget in that skip. A successful review is left alone. A review already in progress is reported as `running` and is not signaled again. History and the existing comment are not deleted or edited by the command; a started review posts through the normal sink when it finishes. The same exit codes apply. `orchestrator trigger-poller` with any other arguments is rejected.
 
 ## Deployment
 

@@ -75,6 +75,54 @@ func TestFetchDiffReturnsFullBodyAtBudget(t *testing.T) {
 	require.Empty(t, diffOverBudget(got, budget))
 }
 
+func TestBudgetSkipLimitRecognizesPostedSkipText(t *testing.T) {
+	historical := "Review skipped: diff is 300001 bytes, over the 300000 byte budget"
+	require.Equal(t, 300_000, budgetSkipLimit(historical))
+	require.Equal(t, 32, budgetSkipLimit(diffOverBudget(strings.Repeat("b", 57), 32)))
+	require.Equal(t, 32, budgetSkipLimit(diffOverBudget(strings.Repeat("c", 33), 32)))
+	require.Equal(t, 0, budgetSkipLimit("empty diff"))
+	require.Equal(t, 0, budgetSkipLimit("looks fine"))
+	body := formatComment(ReviewResult{
+		HeadSHA: "f6781876f495fef29a49586a6cd96a328f334303", LabelKey: "default", Label: LabelDefault, Model: "grok-4.7",
+		Summary: "Review skipped: " + historical, Skipped: historical,
+	})
+	rec := reviewedFromComment(body)
+	require.Equal(t, "f6781876f495fef29a49586a6cd96a328f334303", rec.HeadSHA)
+	require.Equal(t, "grok-4.7", rec.Model)
+	require.Equal(t, 300_000, rec.SkipBudget)
+
+	ok := formatComment(ReviewResult{HeadSHA: "abc1234567890abc", LabelKey: "default", Model: "grok-4.7", Summary: "ship it"})
+	require.Equal(t, 0, reviewedFromComment(ok).SkipBudget)
+}
+
+func TestReviewedFromStatusKeepsInFlightAndOtherHeads(t *testing.T) {
+	skip := "diff is 300001 bytes, over the 300000 byte budget"
+	done := Status{
+		Phase: "done", HeadSHA: "aaa", Model: "grok-4.7",
+		LastResult: &ReviewResult{HeadSHA: "aaa", Model: "grok-4.7", Skipped: skip},
+	}
+	require.Equal(t, 300_000, reviewedFromStatus(done).SkipBudget)
+
+	inflight := done
+	inflight.Phase = "reviewing"
+	require.Equal(t, 0, reviewedFromStatus(inflight).SkipBudget)
+	require.Equal(t, "reviewing", reviewedFromStatus(inflight).Phase)
+
+	newer := Status{
+		Phase: "done", HeadSHA: "bbb", Model: "grok-4.7",
+		LastResult: &ReviewResult{HeadSHA: "aaa", Model: "grok-4.7", Skipped: skip},
+	}
+	require.Equal(t, 0, reviewedFromStatus(newer).SkipBudget)
+
+	success := Status{Phase: "done", HeadSHA: "aaa", Model: "grok-4.7", LastResult: &ReviewResult{HeadSHA: "aaa", Model: "grok-4.7", Summary: "ok"}}
+	require.Equal(t, 0, reviewedFromStatus(success).SkipBudget)
+
+	comment := Reviewed{HeadSHA: "aaa", Model: "grok-4.7", SkipBudget: 300_000}
+	require.Equal(t, 0, mergeReviewRecord(Reviewed{}, queryUnknown, comment).SkipBudget)
+	require.Equal(t, 300_000, mergeReviewRecord(Reviewed{}, queryNotFound, comment).SkipBudget)
+	require.Equal(t, "done", mergeReviewRecord(reviewedFromStatus(done), queryFound, comment).Phase)
+}
+
 func TestFetchDiffTruncatesAtCapAndReviewSkipsPartial(t *testing.T) {
 	const budget = 64
 	full := strings.Repeat("e", budget+40)
