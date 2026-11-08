@@ -114,7 +114,7 @@ func TestLastReviewedTargetsIgnoresPreLabelComments(t *testing.T) {
 	var last map[string]Reviewed
 	require.NoError(t, v.Get(&last))
 	require.Empty(t, last, "a comment without a model marker must not dedupe a newly labelled PR")
-	require.Len(t, TargetsNeedingReview(targets, last), 2)
+	require.Len(t, TargetsNeedingReview(targets, last, 500_000), 2)
 
 	// After both labelled reviews post, both dedupe.
 	require.NoError(t, a.postToGitHub(context.Background(), ReviewResult{Repo: "o/r", PRNumber: 8, HeadSHA: "aaaaaaa1", LabelKey: "default", Model: "grok-4.7"}))
@@ -122,7 +122,7 @@ func TestLastReviewedTargetsIgnoresPreLabelComments(t *testing.T) {
 	v, err = env.ExecuteActivity(a.LastReviewedTargets, targets)
 	require.NoError(t, err)
 	require.NoError(t, v.Get(&last))
-	require.Empty(t, TargetsNeedingReview(targets, last))
+	require.Empty(t, TargetsNeedingReview(targets, last, 500_000))
 }
 
 func TestListOpenPRsReadsLabels(t *testing.T) {

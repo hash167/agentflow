@@ -17,7 +17,8 @@ WorkingDirectory=/opt/agentflow
 ExecStart=/opt/agentflow/orchestrator /opt/agentflow/orchestrator.config.json
 Restart=on-failure
 RestartSec=5
-# Put WEBHOOK_TOKEN / GITHUB_TOKEN / CURSOR_API_KEY here (chmod 600):
+# Tokens only (chmod 600): WEBHOOK_TOKEN, GITHUB_TOKEN, CURSOR_API_KEY.
+# The diff budget is review.maxDiffBytes in the JSON config, not this env file.
 EnvironmentFile=-/etc/agentflow/orchestrator.env
 NoNewPrivileges=true
 ProtectSystem=strict

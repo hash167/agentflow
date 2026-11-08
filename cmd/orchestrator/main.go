@@ -20,6 +20,33 @@ import (
 	"agent-gateway/internal/orchestrator"
 )
 
+func runOperator(cfg *orchestrator.Config, c client.Client, args orchestrator.Args) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var result orchestrator.OperatorResult
+	switch args.Command {
+	case "trigger-poller":
+		if !cfg.Poller.Enabled {
+			result = orchestrator.OperatorResult{Status: orchestrator.StatusError, ScheduleID: cfg.Poller.ScheduleID, Detail: "poller is disabled"}
+			break
+		}
+		handle := c.ScheduleClient().GetHandle(ctx, cfg.Poller.ScheduleID)
+		result, _ = orchestrator.TriggerPollNow(ctx, handle, cfg.Poller.ScheduleID)
+	case "retry-skipped":
+		acts := &orchestrator.Activities{
+			Review: cfg.Review, Poller: cfg.Poller, Temporal: c, TaskQueue: cfg.Temporal.TaskQueue,
+		}
+		result, _ = orchestrator.RunRetrySkipped(ctx, cfg, args.Repo, args.PR, args.HeadSHA, orchestrator.NewRetrySource(acts))
+	default:
+		result = orchestrator.OperatorResult{Status: orchestrator.StatusError, Detail: "unknown operator command"}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(result)
+	log.Printf("[orchestrator] %s %s", args.Command, result.Status)
+	return result.ExitCode()
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -27,13 +54,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func main() {
-	// "orchestrator trigger-poller" triggers one poller run now (kubectl exec).
-	triggerPoller := len(os.Args) > 1 && os.Args[1] == "trigger-poller"
-	configPath := "./orchestrator.config.json"
-	if len(os.Args) > 1 && !triggerPoller {
-		configPath = os.Args[1]
-	} else if env := os.Getenv("ORCHESTRATOR_CONFIG"); env != "" {
-		configPath = env
+	parsed, err := orchestrator.ParseArgs(os.Args[1:])
+	if err != nil {
+		log.Fatalf("[orchestrator] %v", err)
+	}
+	configPath := parsed.ConfigPath
+	if configPath == "" {
+		if env := os.Getenv("ORCHESTRATOR_CONFIG"); env != "" {
+			configPath = env
+		} else {
+			configPath = "./orchestrator.config.json"
+		}
 	}
 	cfg, err := orchestrator.LoadConfig(configPath)
 	if err != nil {
@@ -49,14 +80,10 @@ func main() {
 	}
 	defer temporalClient.Close()
 
-	if triggerPoller {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := temporalClient.ScheduleClient().GetHandle(ctx, cfg.Poller.ScheduleID).Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
-			log.Fatalf("[orchestrator] cannot trigger schedule %s: %v", cfg.Poller.ScheduleID, err)
-		}
-		log.Printf("[orchestrator] triggered schedule %s", cfg.Poller.ScheduleID)
-		return
+	if parsed.Command != "" {
+		code := runOperator(cfg, temporalClient, parsed)
+		temporalClient.Close()
+		os.Exit(code)
 	}
 
 	_, reviewActivityTimeout, _ := cfg.Review.Timeouts() // validated in LoadConfig

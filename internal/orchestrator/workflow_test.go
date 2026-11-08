@@ -86,7 +86,8 @@ func TestOversizedDiffIsSkippedWithoutRunningReviewer(t *testing.T) {
 
 	var result ReviewResult
 	require.NoError(t, future.Get(&result))
-	require.NotEmpty(t, result.Skipped)
+	require.Contains(t, result.Skipped, "over the 10 byte budget")
+	require.NotContains(t, result.Skipped, "truncated")
 	require.Empty(t, result.Findings)
 }
 

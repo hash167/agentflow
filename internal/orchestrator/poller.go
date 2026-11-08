@@ -63,9 +63,14 @@ type ReviewTarget struct {
 func (t ReviewTarget) Key() string { return ReviewWorkflowID(t.Repo, t.PRNumber, t.LabelKey) }
 
 // Reviewed is the last (head SHA, model) reviewed or started for a target.
+// SkipBudget is non-zero only when that attempt finished as a diff-budget
+// skip under that many bytes. Phase is set from a workflow query; a comment
+// fallback leaves it empty.
 type Reviewed struct {
-	HeadSHA string `json:"headSha"`
-	Model   string `json:"model"`
+	HeadSHA    string `json:"headSha"`
+	Model      string `json:"model"`
+	SkipBudget int    `json:"skipBudget,omitempty"`
+	Phase      string `json:"phase,omitempty"`
 }
 
 // PollSummary is the PRPollerWorkflow result (also logged).
@@ -83,6 +88,9 @@ type ListOpenPRsResult struct {
 	Repos   []string       `json:"repos"`
 	PRs     []PRInfo       `json:"prs"`
 	Targets []ReviewTarget `json:"targets"`
+	// MaxDiffBytes is the worker's review budget at poll time. The workflow
+	// uses it to decide whether a finished diff-budget skip may run once more.
+	MaxDiffBytes int `json:"maxDiffBytes"`
 }
 
 // TargetsForPRs applies label gating: unlabeled PRs produce no targets.
@@ -96,16 +104,27 @@ func TargetsForPRs(prs []PRInfo, rules []LabelRule) []ReviewTarget {
 	return out
 }
 
-// TargetsNeedingReview is the dedupe rule: a target needs a review only when
-// its (head SHA, model) differs from the last one reviewed or started.
-func TargetsNeedingReview(targets []ReviewTarget, last map[string]Reviewed) []ReviewTarget {
+// TargetsNeedingReview is the dedupe rule. A target is reviewed when its
+// (head SHA, model) is new. A finished diff-budget skip of the same head and
+// model is reviewed once more only when maxDiffBytes is strictly greater than
+// the budget that produced the skip. The same budget does not retry. An
+// in-progress review (any phase other than done) is left alone. A successful
+// review is not repeated because the budget later grew.
+func TargetsNeedingReview(targets []ReviewTarget, last map[string]Reviewed, maxDiffBytes int) []ReviewTarget {
 	var out []ReviewTarget
 	for _, t := range targets {
 		if t.HeadSHA == "" {
 			continue
 		}
-		if prev, ok := last[t.Key()]; ok && prev.HeadSHA != "" &&
+		prev, ok := last[t.Key()]
+		if ok && prev.HeadSHA != "" &&
 			strings.EqualFold(prev.HeadSHA, t.HeadSHA) && strings.EqualFold(prev.Model, t.Model) {
+			if prev.Phase != "" && prev.Phase != "done" {
+				continue
+			}
+			if prev.SkipBudget > 0 && maxDiffBytes > prev.SkipBudget {
+				out = append(out, t)
+			}
 			continue
 		}
 		out = append(out, t)
@@ -138,7 +157,7 @@ func PRPollerWorkflow(ctx workflow.Context) (PollSummary, error) {
 		if err := workflow.ExecuteActivity(actx, a.LastReviewedTargets, listed.Targets).Get(ctx, &last); err != nil {
 			return summary, err
 		}
-		todo := TargetsNeedingReview(listed.Targets, last)
+		todo := TargetsNeedingReview(listed.Targets, last, listed.MaxDiffBytes)
 		summary.Unchanged = len(listed.Targets) - len(todo)
 		if len(todo) > 0 {
 			if err := workflow.ExecuteActivity(actx, a.StartReviewTargets, todo).Get(ctx, &summary.Triggered); err != nil {
@@ -199,7 +218,7 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 	if err != nil {
 		return ListOpenPRsResult{}, asTemporalError(err)
 	}
-	result := ListOpenPRsResult{Repos: []string{}, PRs: []PRInfo{}}
+	result := ListOpenPRsResult{Repos: []string{}, PRs: []PRInfo{}, MaxDiffBytes: a.Review.MaxDiffBytes}
 	for _, repo := range repos {
 		if !strings.EqualFold(repo.Owner.Login, cfg.Owner) || repo.Archived || repo.Disabled {
 			continue
@@ -250,58 +269,129 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 // status query (running and closed executions within retention), then from
 // the head/model markers in that label's comment. Comments without a model
 // marker (pre-label reviews) do not count, so labelling a PR reviews it.
+// A finished diff-budget skip also carries the budget that skipped it.
 func (a *Activities) LastReviewedTargets(ctx context.Context, targets []ReviewTarget) (map[string]Reviewed, error) {
 	out := map[string]Reviewed{}
 	for _, t := range targets {
 		activity.RecordHeartbeat(ctx, t.Key())
-		if r := a.reviewedFromWorkflow(ctx, t.Key()); r.HeadSHA != "" {
-			out[t.Key()] = r
-			continue
+		rec, err := a.reviewedTarget(ctx, t)
+		if err != nil {
+			return nil, err
 		}
-		if a.Review.Sink.Type == "github" {
-			gh, err := a.github()
-			if err != nil {
-				return nil, err
-			}
-			comment, err := gh.FindReviewComment(ctx, t.Repo, t.PRNumber, MarkerFor(t.LabelKey))
-			if err != nil {
-				return nil, asTemporalError(err)
-			}
-			if comment != nil {
-				if sha, model := HeadSHAFromComment(comment.Body), ModelFromComment(comment.Body); sha != "" && model != "" {
-					out[t.Key()] = Reviewed{HeadSHA: sha, Model: model}
-				}
-			}
+		if rec.HeadSHA != "" {
+			out[t.Key()] = rec
 		}
 	}
 	return out, nil
 }
 
-func (a *Activities) reviewedFromWorkflow(ctx context.Context, workflowID string) Reviewed {
+type workflowQuery int
+
+const (
+	queryNotFound workflowQuery = iota
+	queryFound
+	queryUnknown
+)
+
+// reviewedTarget resolves one target from its workflow query, then its comment.
+// A query that fails for a reason other than not-found still uses the comment
+// for the head and model, but drops the skip budget so a blip cannot retry.
+func (a *Activities) reviewedTarget(ctx context.Context, t ReviewTarget) (Reviewed, error) {
+	rec, q := a.reviewedFromWorkflow(ctx, t.Key())
+	if q == queryFound && rec.HeadSHA != "" {
+		return rec, nil
+	}
+	comment := Reviewed{}
+	if a.Review.Sink.Type == "github" {
+		gh, err := a.github()
+		if err != nil {
+			return Reviewed{}, err
+		}
+		found, err := gh.FindReviewComment(ctx, t.Repo, t.PRNumber, MarkerFor(t.LabelKey))
+		if err != nil {
+			return Reviewed{}, asTemporalError(err)
+		}
+		if found != nil {
+			comment = reviewedFromComment(found.Body)
+		}
+	}
+	return mergeReviewRecord(rec, q, comment), nil
+}
+
+func (a *Activities) reviewedFromWorkflow(ctx context.Context, workflowID string) (Reviewed, workflowQuery) {
 	if a.Temporal == nil {
-		return Reviewed{}
+		return Reviewed{}, queryNotFound
 	}
 	qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	resp, err := a.Temporal.QueryWorkflow(qctx, workflowID, "", QueryStatus)
 	if err != nil {
 		var notFound *serviceerror.NotFound
-		if !errors.As(err, &notFound) {
+		if errors.As(err, &notFound) {
+			return Reviewed{}, queryNotFound
+		}
+		if activity.IsActivity(ctx) {
 			activity.GetLogger(ctx).Warn("status query failed", "workflow", workflowID, "error", err.Error())
 		}
-		return Reviewed{}
+		return Reviewed{}, queryUnknown
 	}
 	var status Status
 	if err := resp.Get(&status); err != nil {
+		return Reviewed{}, queryUnknown
+	}
+	return reviewedFromStatus(status), queryFound
+}
+
+// reviewedFromStatus copies the workflow query. SkipBudget is set only when
+// the cycle finished and its result is for this same head and model, so an
+// in-flight review is not restarted and a newer head does not inherit an
+// older skip.
+func reviewedFromStatus(status Status) Reviewed {
+	head, model := status.HeadSHA, status.Model
+	if head == "" && status.LastResult != nil {
+		head = status.LastResult.HeadSHA
+		if model == "" {
+			model = status.LastResult.Model
+		}
+	}
+	if head == "" {
 		return Reviewed{}
 	}
-	if status.HeadSHA != "" {
-		return Reviewed{HeadSHA: status.HeadSHA, Model: status.Model}
+	rec := Reviewed{HeadSHA: head, Model: model, Phase: status.Phase}
+	if status.Phase != "done" || status.LastResult == nil {
+		return rec
 	}
-	if status.LastResult != nil {
-		return Reviewed{HeadSHA: status.LastResult.HeadSHA, Model: status.LastResult.Model}
+	result := status.LastResult
+	if !strings.EqualFold(result.HeadSHA, head) {
+		return rec
 	}
-	return Reviewed{}
+	if result.Model != "" && !strings.EqualFold(result.Model, model) {
+		return rec
+	}
+	rec.SkipBudget = budgetSkipLimit(result.Skipped)
+	return rec
+}
+
+func reviewedFromComment(body string) Reviewed {
+	sha, model := HeadSHAFromComment(body), ModelFromComment(body)
+	if sha == "" || model == "" {
+		return Reviewed{}
+	}
+	return Reviewed{HeadSHA: sha, Model: model, SkipBudget: budgetSkipLimit(body)}
+}
+
+func mergeReviewRecord(fromWorkflow Reviewed, q workflowQuery, comment Reviewed) Reviewed {
+	if q == queryFound && fromWorkflow.HeadSHA != "" {
+		return fromWorkflow
+	}
+	if q == queryUnknown {
+		comment.SkipBudget = 0
+		comment.Phase = ""
+	}
+	if fromWorkflow.HeadSHA != "" {
+		return fromWorkflow
+	}
+	return comment
 }
 
 // StartReviewTargets signal-with-starts one review workflow per target
@@ -312,17 +402,7 @@ func (a *Activities) StartReviewTargets(ctx context.Context, targets []ReviewTar
 	}
 	started := []string{}
 	for _, t := range targets {
-		request := ReviewRequest{
-			Repo:     t.Repo,
-			PRNumber: t.PRNumber,
-			Title:    t.Title,
-			HeadSHA:  t.HeadSHA,
-			DiffURL:  fmt.Sprintf("%s/repos/%s/pulls/%d", a.apiBase(), t.Repo, t.PRNumber),
-			LabelKey: t.LabelKey,
-			Label:    t.Label,
-			Model:    t.Model,
-		}
-		if err := StartReview(ctx, a.Temporal, a.TaskQueue, t.Key(), request); err != nil {
+		if err := StartReview(ctx, a.Temporal, a.TaskQueue, t.Key(), reviewRequestForTarget(a.apiBase(), t)); err != nil {
 			return started, err
 		}
 		started = append(started, fmt.Sprintf("%s#%d:%s@%.7s(%s)", t.Repo, t.PRNumber, t.LabelKey, t.HeadSHA, t.Model))

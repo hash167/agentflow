@@ -50,6 +50,29 @@ func TestPollerConfigValidation(t *testing.T) {
 	require.False(t, cfg.Poller.IncludeDrafts)
 }
 
+func TestMaxDiffBytesDefaultLeavesOtherCapsAlone(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"]}}`))
+	require.NoError(t, err)
+	require.Equal(t, DefaultMaxDiffBytes, cfg.Review.MaxDiffBytes)
+	require.Equal(t, 500_000, cfg.Review.MaxDiffBytes)
+	reviewer, activity, err := cfg.Review.Timeouts()
+	require.NoError(t, err)
+	require.Equal(t, DefaultReviewerTimeout, reviewer)
+	require.Equal(t, DefaultActivityTimeout, activity)
+	require.Equal(t, DefaultMaxConcurrentActivities, cfg.Worker.MaxConcurrentActivities)
+}
+
+func TestMaxDiffBytesOverrideLeavesTimeoutsAlone(t *testing.T) {
+	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"],"maxDiffBytes":123456,"reviewerTimeout":"12m","activityTimeout":"15m"},"worker":{"maxConcurrentActivities":4}}`))
+	require.NoError(t, err)
+	require.Equal(t, 123456, cfg.Review.MaxDiffBytes)
+	reviewer, activity, err := cfg.Review.Timeouts()
+	require.NoError(t, err)
+	require.Equal(t, 12*time.Minute, reviewer)
+	require.Equal(t, 15*time.Minute, activity)
+	require.Equal(t, 4, cfg.Worker.MaxConcurrentActivities)
+}
+
 func TestReviewTimeoutDefaults(t *testing.T) {
 	cfg, err := LoadConfig(writeConfig(t, `{"review":{"reviewerCommand":["x"]}}`))
 	require.NoError(t, err)

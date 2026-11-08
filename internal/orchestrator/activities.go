@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,12 +82,58 @@ func (a *Activities) FetchDiff(ctx context.Context, request ReviewRequest) (stri
 		}
 		return "", err
 	}
-	limit := int64(a.Review.MaxDiffBytes) + 1
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit))
+	// Stop one byte past the budget. That extra byte is a cap, not the
+	// remote object's size: a longer response must be skipped, never reviewed
+	// as if this prefix were the full diff.
+	body, err := io.ReadAll(io.LimitReader(response.Body, diffFetchLimit(a.Review.MaxDiffBytes)))
 	if err != nil {
 		return "", err
 	}
 	return string(body), nil
+}
+
+// diffFetchLimit is the most FetchDiff will read. The extra byte distinguishes
+// "fits in the budget" from "stopped early".
+func diffFetchLimit(maxDiffBytes int) int64 {
+	return int64(maxDiffBytes) + 1
+}
+
+// diffOverBudget explains why a diff must not be reviewed, or returns "" when
+// it fits. A length of max+1 is the fetch cap (the full size may be larger).
+// A greater length is an inline body whose real size is known.
+func diffOverBudget(diff string, maxDiffBytes int) string {
+	n := len(diff)
+	if n <= maxDiffBytes {
+		return ""
+	}
+	if n == maxDiffBytes+1 {
+		return fmt.Sprintf("diff exceeds the %d byte budget (read %d bytes, the fetch cap; full size may be larger; truncated diff not reviewed)", maxDiffBytes, n)
+	}
+	return fmt.Sprintf("diff is %d bytes, over the %d byte budget", n, maxDiffBytes)
+}
+
+// budgetSkipPatterns match the budget number embedded in diffOverBudget and in
+// comments posted by older builds ("over the N byte budget").
+var budgetSkipPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`over the ([0-9]+) byte budget`),
+	regexp.MustCompile(`exceeds the ([0-9]+) byte budget`),
+}
+
+// budgetSkipLimit returns the maxDiffBytes that produced a diff-budget skip,
+// or 0 when text is not one. Other skip reasons, including an empty diff,
+// return 0.
+func budgetSkipLimit(text string) int {
+	for _, re := range budgetSkipPatterns {
+		m := re.FindStringSubmatch(text)
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 type reviewerInput struct {
@@ -109,8 +157,8 @@ func (a *Activities) RunReviewAgent(ctx context.Context, request ReviewRequest) 
 		Model:    request.Model,
 	}
 
-	if len(request.Diff) > a.Review.MaxDiffBytes {
-		result.Skipped = fmt.Sprintf("diff is %d bytes, over the %d byte budget", len(request.Diff), a.Review.MaxDiffBytes)
+	if reason := diffOverBudget(request.Diff, a.Review.MaxDiffBytes); reason != "" {
+		result.Skipped = reason
 		result.Summary = "Review skipped: " + result.Skipped
 		return result, nil
 	}
