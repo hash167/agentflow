@@ -10,7 +10,7 @@
   },
   "review": {
     "reviewerCommand": ["go", "run", "./cmd/mock-reviewer"],
-    "maxDiffBytes": 300000,
+    "maxDiffBytes": 500000,
     "sink": {
       "type": "file",
       "dir": "./reviews"

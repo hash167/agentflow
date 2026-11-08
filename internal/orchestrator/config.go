@@ -34,9 +34,11 @@ type ReviewConfig struct {
 	// stdin and must print a ReviewResult-shaped JSON object ({"summary",
 	// "findings"}) on stdout. Swap the bundled mock for the headless Cursor
 	// CLI (or any agent) in production.
-	ReviewerCommand []string   `json:"reviewerCommand"`
-	MaxDiffBytes    int        `json:"maxDiffBytes"`
-	Sink            SinkConfig `json:"sink"`
+	ReviewerCommand []string `json:"reviewerCommand"`
+	// MaxDiffBytes caps the unified diff in bytes. An explicit JSON value
+	// replaces DefaultMaxDiffBytes. No environment variable overrides it.
+	MaxDiffBytes int        `json:"maxDiffBytes"`
+	Sink         SinkConfig `json:"sink"`
 	// ReviewerTimeout bounds one reviewer subprocess run (Go duration, default
 	// "12m"). LoadConfig always fills it in and the orchestrator passes it to
 	// the reviewer as CURSOR_REVIEW_TIMEOUT, overriding the pod environment.
@@ -55,6 +57,11 @@ type ReviewConfig struct {
 }
 
 const (
+	// DefaultMaxDiffBytes applies when review.maxDiffBytes is omitted.
+	// FetchDiff reads at most one extra byte so a longer body is skipped
+	// instead of reviewed as a truncated diff. 500000 leaves headroom over a
+	// ~409KB pull diff and still skips anything larger.
+	DefaultMaxDiffBytes    = 500_000
 	DefaultReviewerTimeout = 12 * time.Minute
 	DefaultActivityTimeout = 15 * time.Minute
 	// minTimeoutMargin is how much longer the activity must be than the
@@ -110,7 +117,7 @@ func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		Temporal: TemporalConfig{HostPort: "127.0.0.1:7233", Namespace: "default", TaskQueue: "code-review"},
 		Webhook:  WebhookConfig{Host: "127.0.0.1", Port: 4819},
-		Review:   ReviewConfig{MaxDiffBytes: 300_000, Sink: SinkConfig{Type: "file", Dir: "./reviews"}},
+		Review:   ReviewConfig{MaxDiffBytes: DefaultMaxDiffBytes, Sink: SinkConfig{Type: "file", Dir: "./reviews"}},
 		Worker:   WorkerConfig{MaxConcurrentActivities: DefaultMaxConcurrentActivities},
 		Poller:   PollerConfig{ScheduleID: "pr-poller", Interval: "15m", Owner: "hash167", IncludeDrafts: true},
 	}

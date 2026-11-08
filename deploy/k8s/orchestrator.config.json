@@ -15,7 +15,7 @@
     "reviewerCommand": [
       "/app/cursor-reviewer"
     ],
-    "maxDiffBytes": 300000,
+    "maxDiffBytes": 500000,
     "sink": {
       "type": "github"
     },
