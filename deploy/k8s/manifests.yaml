@@ -39,6 +39,15 @@ spec:
           ports:
             - containerPort: 4817
               name: mcp
+          env:
+            # Tracing is a no-op until OTEL_EXPORTER_OTLP_ENDPOINT is set.
+            # After applying deploy/k8s/otel-collector.yaml:
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: http://otel-collector.agent-gateway.svc.cluster.local:4318
+            # - name: OTEL_SERVICE_NAME
+            #   value: agent-gateway
+            # - name: AGENTFLOW_ENVIRONMENT
+            #   value: test
           envFrom:
             - secretRef:
                 name: gateway-keys

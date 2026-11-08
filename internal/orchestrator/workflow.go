@@ -73,9 +73,15 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 	var activities *Activities
 	request := initial
 	var result ReviewResult
+	logger := workflow.GetLogger(ctx)
+	cycle := 0
 
 	for {
 		request = drainLatest(request)
+		cycle++
+		logger.Info("review cycle start",
+			"repo", request.Repo, "pr", request.PRNumber, "sha", request.HeadSHA,
+			"model", request.Model, "label", request.LabelKey, "cycle", cycle)
 
 		status.Phase = "fetching"
 		status.HeadSHA = request.HeadSHA
@@ -84,6 +90,7 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		if request.Diff == "" && request.DiffURL != "" {
 			if err := workflow.ExecuteActivity(activityCtx, activities.FetchDiff, request).
 				Get(ctx, &request.Diff); err != nil {
+				logger.Error("review cycle finish", "outcome", "failed", "cycle", cycle, "stage", "fetch")
 				return ReviewResult{}, err
 			}
 		}
@@ -91,12 +98,14 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		status.Phase = "reviewing"
 		if err := workflow.ExecuteActivity(reviewCtx, activities.RunReviewAgent, request).
 			Get(ctx, &result); err != nil {
+			logger.Error("review cycle finish", "outcome", "failed", "cycle", cycle, "stage", "review")
 			return ReviewResult{}, err
 		}
 
 		status.Phase = "posting"
 		if err := workflow.ExecuteActivity(activityCtx, activities.PostReview, result).
 			Get(ctx, nil); err != nil {
+			logger.Error("review cycle finish", "outcome", "failed", "cycle", cycle, "stage", "post")
 			return ReviewResult{}, err
 		}
 
@@ -106,9 +115,17 @@ func CodeReviewWorkflow(ctx workflow.Context, initial ReviewRequest) (ReviewResu
 		// A push that landed mid-review supersedes the result we just posted.
 		var next ReviewRequest
 		if signals.ReceiveAsync(&next) {
+			logger.Info("review cycle finish", "outcome", "superseded", "cycle", cycle, "findings", len(result.Findings))
 			request = next
 			continue
 		}
+		outcome := "reviewed"
+		if result.Skipped != "" {
+			outcome = "skipped"
+		} else if len(result.Findings) == 0 {
+			outcome = "reviewed_clean"
+		}
+		logger.Info("review cycle finish", "outcome", outcome, "cycle", cycle, "findings", len(result.Findings))
 		status.Phase = "done"
 		return result, nil
 	}

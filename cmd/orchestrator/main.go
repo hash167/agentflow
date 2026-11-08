@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/sdk/worker"
 
 	"agent-gateway/internal/orchestrator"
+	"agent-gateway/internal/telemetry"
 )
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -40,9 +41,20 @@ func main() {
 		log.Fatalf("[orchestrator] fatal: %v", err)
 	}
 
+	tel := telemetry.Init(context.Background(), telemetry.Options{
+		ServiceName: "orchestrator",
+		Enabled:     cfg.Tracing.Enabled,
+		Endpoint:    cfg.Tracing.OTLPEndpoint,
+		Protocol:    cfg.Tracing.Protocol,
+		Environment: cfg.Tracing.Environment,
+		RunKind:     cfg.Tracing.RunKind,
+	})
+	defer tel.Shutdown(5 * time.Second)
+
 	temporalClient, err := client.Dial(client.Options{
-		HostPort:  cfg.Temporal.HostPort,
-		Namespace: cfg.Temporal.Namespace,
+		HostPort:     cfg.Temporal.HostPort,
+		Namespace:    cfg.Temporal.Namespace,
+		Interceptors: telemetry.WithClientInterceptors(nil),
 	})
 	if err != nil {
 		log.Fatalf("[orchestrator] cannot reach Temporal at %s: %v (is the server running?)", cfg.Temporal.HostPort, err)
@@ -135,11 +147,23 @@ func main() {
 		for _, rule := range rules {
 			req := request
 			req.LabelKey, req.Label, req.Model = rule.Key, rule.Label, rule.Model
+			if req.Forge == "" {
+				req.Forge = telemetry.ForgeGitHub
+			}
 			workflowID := orchestrator.ReviewWorkflowID(req.Repo, req.PRNumber, rule.Key)
-			if err := orchestrator.StartReview(ctx, temporalClient, cfg.Temporal.TaskQueue, workflowID, req); err != nil {
+			sctx, span := telemetry.Start(ctx, telemetry.SpanStartTarget)
+			req.TraceLink = telemetry.TraceParent(sctx)
+			telemetry.RecordCycleStarted(sctx, telemetry.Correlation{
+				Repo: req.Repo, Forge: req.Forge, PRNumber: req.PRNumber, HeadSHA: req.HeadSHA,
+				LabelKey: req.LabelKey, Label: req.Label, Model: req.Model,
+				ReviewKey: workflowID, RunKind: req.RunKind,
+			}, req.TraceLink)
+			if err := orchestrator.StartReview(telemetry.WithoutSpan(sctx), temporalClient, cfg.Temporal.TaskQueue, workflowID, req); err != nil {
+				telemetry.End(span, err, "")
 				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "cannot start workflow: " + err.Error(), "workflowIds": ids})
 				return
 			}
+			span.End()
 			ids = append(ids, workflowID)
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"workflowIds": ids})

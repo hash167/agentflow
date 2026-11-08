@@ -67,6 +67,21 @@ func TestParseCLIOutput(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidOutput))
 }
 
+func TestPromptTemplateHashIsStableAndHasNoDiff(t *testing.T) {
+	h1 := PromptTemplateHash()
+	h2 := PromptTemplateHash()
+	require.Equal(t, h1, h2)
+	require.Len(t, h1, 64)
+	require.NotContains(t, Prompt(Input{Repo: "{{repo}}", Title: "{{title}}"}, "{{diff_file}}", true), "CURSOR_API_KEY")
+}
+
+func TestMCPConfigDoesNotInlineTraceparent(t *testing.T) {
+	t.Setenv("TRACEPARENT", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+	raw := MCPConfig("http://gw/mcp", GatewayKeyEnv)
+	require.NotContains(t, string(raw), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	require.Contains(t, string(raw), "${env:TRACEPARENT}")
+}
+
 func TestMCPConfigReferencesKeyByName(t *testing.T) {
 	t.Setenv(GatewayKeyEnv, "super-secret-value")
 	raw := MCPConfig("http://gw/mcp", GatewayKeyEnv)
@@ -80,6 +95,7 @@ func TestMCPConfigReferencesKeyByName(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &cfg))
 	require.Equal(t, "http://gw/mcp", cfg.MCPServers[MCPServerName].URL)
 	require.Equal(t, "Bearer ${env:GATEWAY_REVIEWER_KEY}", cfg.MCPServers[MCPServerName].Headers["Authorization"])
+	require.Equal(t, "${env:TRACEPARENT}", cfg.MCPServers[MCPServerName].Headers["traceparent"])
 }
 
 // fakeAgent writes a shell script that records its argv and the workspace

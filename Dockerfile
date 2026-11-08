@@ -5,11 +5,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
- && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/demo-upstream ./cmd/demo-upstream \
- && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/orchestrator ./cmd/orchestrator \
- && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/mock-reviewer ./cmd/mock-reviewer \
- && CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/cursor-reviewer ./cmd/cursor-reviewer
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X agent-gateway/internal/telemetry.ServiceVersion=${VERSION}" -o /out/gateway ./cmd/gateway \
+ && CGO_ENABLED=0 go build -ldflags="-s -w -X agent-gateway/internal/telemetry.ServiceVersion=${VERSION}" -o /out/demo-upstream ./cmd/demo-upstream \
+ && CGO_ENABLED=0 go build -ldflags="-s -w -X agent-gateway/internal/telemetry.ServiceVersion=${VERSION}" -o /out/orchestrator ./cmd/orchestrator \
+ && CGO_ENABLED=0 go build -ldflags="-s -w -X agent-gateway/internal/telemetry.ServiceVersion=${VERSION}" -o /out/mock-reviewer ./cmd/mock-reviewer \
+ && CGO_ENABLED=0 go build -ldflags="-s -w -X agent-gateway/internal/telemetry.ServiceVersion=${VERSION}" -o /out/cursor-reviewer ./cmd/cursor-reviewer
 
 # Cursor CLI via the official installer (https://cursor.com/docs/cli/installation).
 # It installs into $HOME/.local/share/cursor-agent/versions/<version>; we

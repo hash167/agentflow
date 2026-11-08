@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"agent-gateway/internal/audit"
 	"agent-gateway/internal/config"
 	"agent-gateway/internal/gateway"
+	"agent-gateway/internal/telemetry"
 	"agent-gateway/internal/upstream"
 )
 
@@ -28,6 +30,9 @@ func main() {
 		log.Fatalf("[gateway] fatal: %v", err)
 	}
 
+	tel := telemetry.Init(context.Background(), telemetry.Options{ServiceName: "agent-gateway"})
+	defer tel.Shutdown(5 * time.Second)
+
 	auditLog, err := audit.New(cfg.AuditLog)
 	if err != nil {
 		log.Fatalf("[gateway] fatal: %v", err)
@@ -42,7 +47,7 @@ func main() {
 	defer upstreams.Stop()
 
 	address := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	server := &http.Server{Addr: address, Handler: gateway.NewHandler(cfg, upstreams, auditLog)}
+	server := &http.Server{Addr: address, Handler: telemetry.WrapHTTP("agent-gateway", gateway.NewHandler(cfg, upstreams, auditLog))}
 
 	go func() {
 		<-ctx.Done()

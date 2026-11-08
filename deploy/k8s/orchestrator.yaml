@@ -65,6 +65,18 @@ spec:
             # review.reviewerTimeout from the config (default 12m).
             - name: CURSOR_REVIEW_TIMEOUT
               value: 12m
+            # Tracing is a no-op until OTEL_EXPORTER_OTLP_ENDPOINT is set.
+            # After applying deploy/k8s/otel-collector.yaml:
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: http://otel-collector.agent-gateway.svc.cluster.local:4318
+            # - name: OTEL_EXPORTER_OTLP_PROTOCOL
+            #   value: http/protobuf
+            # - name: OTEL_SERVICE_NAME
+            #   value: orchestrator
+            # - name: AGENTFLOW_ENVIRONMENT
+            #   value: test
+            # - name: OTEL_SERVICE_VERSION
+            #   value: "0.2.3"
           envFrom:
             - secretRef:
                 name: orchestrator-tokens

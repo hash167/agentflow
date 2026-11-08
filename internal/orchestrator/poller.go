@@ -8,12 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
+
+	"agent-gateway/internal/telemetry"
 )
 
 // PollerConfig drives the PR poller: a Temporal Schedule that periodically
@@ -148,7 +151,7 @@ func PRPollerWorkflow(ctx workflow.Context) (PollSummary, error) {
 	}
 	workflow.GetLogger(ctx).Info("pr-poller run",
 		"repos", len(summary.Repos), "openPRs", summary.OpenPRs, "unlabeled", summary.Unlabeled, "targets", summary.Targets,
-		"triggered", strings.Join(summary.Triggered, ","), "unchanged", summary.Unchanged)
+		"triggered", len(summary.Triggered), "unchanged", summary.Unchanged)
 	return summary, nil
 }
 
@@ -185,7 +188,35 @@ type ghPull struct {
 
 // ListOpenPRs lists open PRs in the owner's non-archived repos visible to
 // GITHUB_TOKEN, filtered by the allow/deny lists and the draft setting.
-func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error) {
+func (a *Activities) ListOpenPRs(ctx context.Context) (result ListOpenPRsResult, err error) {
+	scheduleID := a.Poller.ScheduleID
+	if scheduleID == "" {
+		scheduleID = "pr-poller"
+	}
+	telemetry.RecordAttemptStarted(ctx, "ListOpenPRs", telemetry.Correlation{}, attemptAttrs(ctx)...)
+	ctx, run := telemetry.Start(ctx, telemetry.SpanPollerRun,
+		attribute.String(telemetry.AttrPollerSchedule, scheduleID),
+		attribute.String(telemetry.AttrForge, telemetry.ForgeGitHub),
+	)
+	defer func() {
+		labelled := map[string]bool{}
+		for _, t := range result.Targets {
+			labelled[WorkflowID(t.Repo, t.PRNumber)] = true
+		}
+		run.SetAttributes(
+			attribute.Int(telemetry.AttrPollerRepos, len(result.Repos)),
+			attribute.Int(telemetry.AttrPollerOpenPRs, len(result.PRs)),
+			attribute.Int(telemetry.AttrPollerUnlabeled, len(result.PRs)-len(labelled)),
+			attribute.Int(telemetry.AttrPollerTargets, len(result.Targets)),
+		)
+		outcome := telemetry.OutcomeReviewed
+		if err != nil {
+			outcome = telemetry.OutcomeFailed
+		}
+		telemetry.End(run, err, "")
+		telemetry.RecordAttemptFinished(ctx, "ListOpenPRs", outcome, telemetry.Classify(err, ""), telemetry.Correlation{}, attemptAttrs(ctx)...)
+	}()
+
 	gh, err := a.github()
 	if err != nil {
 		return ListOpenPRsResult{}, err
@@ -199,7 +230,7 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 	if err != nil {
 		return ListOpenPRsResult{}, asTemporalError(err)
 	}
-	result := ListOpenPRsResult{Repos: []string{}, PRs: []PRInfo{}}
+	result = ListOpenPRsResult{Repos: []string{}, PRs: []PRInfo{}}
 	for _, repo := range repos {
 		if !strings.EqualFold(repo.Owner.Login, cfg.Owner) || repo.Archived || repo.Disabled {
 			continue
@@ -216,20 +247,34 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 	for _, repo := range result.Repos {
 		if gh.RateRemaining >= 0 && gh.RateRemaining < minRemaining {
 			activity.GetLogger(ctx).Warn("github rate limit low; stopping this poll early", "remaining", gh.RateRemaining)
+			_, skip := telemetry.Start(ctx, telemetry.SpanScanRepo,
+				attribute.String(telemetry.AttrRepo, repo),
+				attribute.String(telemetry.AttrForge, telemetry.ForgeGitHub),
+				attribute.String(telemetry.AttrScanSkipped, "rate_limit"),
+			)
+			skip.End()
 			break
 		}
 		activity.RecordHeartbeat(ctx, repo)
-		pulls, err := getAll[ghPull](ctx, gh, fmt.Sprintf("/repos/%s/pulls?state=open&per_page=100", repo), "list pulls")
-		if err != nil {
+		_, scan := telemetry.Start(ctx, telemetry.SpanScanRepo,
+			attribute.String(telemetry.AttrRepo, repo),
+			attribute.String(telemetry.AttrForge, telemetry.ForgeGitHub),
+		)
+		pulls, listErr := getAll[ghPull](ctx, gh, fmt.Sprintf("/repos/%s/pulls?state=open&per_page=100", repo), "list pulls")
+		if listErr != nil {
 			var ghErr *GitHubError
 			// Any non-rate-limit 4xx (no access, empty/blocked repo...) only
 			// skips that repo; it must not fail the whole poll.
-			if errors.As(err, &ghErr) && !ghErr.RateLimited && ghErr.Status >= 400 && ghErr.Status < 500 {
-				activity.GetLogger(ctx).Warn("skipping repo", "repo", repo, "error", err.Error())
+			if errors.As(listErr, &ghErr) && !ghErr.RateLimited && ghErr.Status >= 400 && ghErr.Status < 500 {
+				activity.GetLogger(ctx).Warn("skipping repo", "repo", repo, "status", ghErr.Status)
+				scan.SetAttributes(attribute.String(telemetry.AttrScanSkipped, fmt.Sprintf("http_%d", ghErr.Status)))
+				scan.End()
 				continue
 			}
-			return result, err
+			telemetry.End(scan, listErr, "")
+			return result, listErr
 		}
+		open, labeled := 0, 0
 		for _, p := range pulls {
 			if p.Draft && !cfg.IncludeDrafts {
 				continue
@@ -238,8 +283,18 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 			for _, l := range p.Labels {
 				labels = append(labels, l.Name)
 			}
-			result.PRs = append(result.PRs, PRInfo{Repo: repo, PRNumber: p.Number, Title: p.Title, HeadSHA: p.Head.SHA, Draft: p.Draft, Labels: labels})
+			open++
+			info := PRInfo{Repo: repo, PRNumber: p.Number, Title: p.Title, HeadSHA: p.Head.SHA, Draft: p.Draft, Labels: labels}
+			result.PRs = append(result.PRs, info)
+			if len(MatchLabels(a.Review.Labels, labels)) > 0 {
+				labeled++
+			}
 		}
+		scan.SetAttributes(
+			attribute.Int(telemetry.AttrScanPRsOpen, open),
+			attribute.Int(telemetry.AttrScanPRsLabeled, labeled),
+		)
+		scan.End()
 	}
 	result.Targets = TargetsForPRs(result.PRs, a.Review.Labels)
 	return result, nil
@@ -250,29 +305,67 @@ func (a *Activities) ListOpenPRs(ctx context.Context) (ListOpenPRsResult, error)
 // status query (running and closed executions within retention), then from
 // the head/model markers in that label's comment. Comments without a model
 // marker (pre-label reviews) do not count, so labelling a PR reviews it.
-func (a *Activities) LastReviewedTargets(ctx context.Context, targets []ReviewTarget) (map[string]Reviewed, error) {
-	out := map[string]Reviewed{}
+func (a *Activities) LastReviewedTargets(ctx context.Context, targets []ReviewTarget) (out map[string]Reviewed, err error) {
+	c := telemetry.Correlation{}
+	telemetry.RecordAttemptStarted(ctx, "LastReviewedTargets", c, attemptAttrs(ctx)...)
+	defer func() {
+		outcome := telemetry.OutcomeReviewed
+		if err != nil {
+			outcome = telemetry.OutcomeFailed
+		}
+		telemetry.RecordAttemptFinished(ctx, "LastReviewedTargets", outcome, telemetry.Classify(err, ""), c, attemptAttrs(ctx)...)
+	}()
+	out = map[string]Reviewed{}
 	for _, t := range targets {
 		activity.RecordHeartbeat(ctx, t.Key())
+		tc := corrTarget(t)
+		_, span := startSpan(ctx, telemetry.SpanDedupeCheck, tc)
+		source, decision := "none", "review"
 		if r := a.reviewedFromWorkflow(ctx, t.Key()); r.HeadSHA != "" {
 			out[t.Key()] = r
+			source = "workflow_query"
+			if strings.EqualFold(r.HeadSHA, t.HeadSHA) && strings.EqualFold(r.Model, t.Model) {
+				decision = "skip"
+			}
+			span.SetAttributes(
+				attribute.String(telemetry.AttrDedupeSource, source),
+				attribute.String(telemetry.AttrDedupeDecision, decision),
+				attribute.String(telemetry.AttrDedupePrevSHA, r.HeadSHA),
+				attribute.String(telemetry.AttrDedupePrevModel, r.Model),
+			)
+			span.End()
 			continue
 		}
 		if a.Review.Sink.Type == "github" {
-			gh, err := a.github()
-			if err != nil {
-				return nil, err
+			gh, ghErr := a.github()
+			if ghErr != nil {
+				telemetry.End(span, ghErr, "")
+				return nil, ghErr
 			}
-			comment, err := gh.FindReviewComment(ctx, t.Repo, t.PRNumber, MarkerFor(t.LabelKey))
-			if err != nil {
-				return nil, asTemporalError(err)
+			comment, findErr := gh.FindReviewComment(ctx, t.Repo, t.PRNumber, MarkerFor(t.LabelKey))
+			if findErr != nil {
+				telemetry.End(span, findErr, "")
+				return nil, asTemporalError(findErr)
 			}
 			if comment != nil {
 				if sha, model := HeadSHAFromComment(comment.Body), ModelFromComment(comment.Body); sha != "" && model != "" {
 					out[t.Key()] = Reviewed{HeadSHA: sha, Model: model}
+					source = "comment_marker"
+					if strings.EqualFold(sha, t.HeadSHA) && strings.EqualFold(model, t.Model) {
+						decision = "skip"
+					}
+					span.SetAttributes(
+						attribute.String(telemetry.AttrDedupePrevSHA, sha),
+						attribute.String(telemetry.AttrDedupePrevModel, model),
+					)
 				}
 			}
 		}
+		span.SetAttributes(
+			attribute.String(telemetry.AttrDedupeSource, source),
+			attribute.String(telemetry.AttrDedupeDecision, decision),
+		)
+		span.End()
 	}
 	return out, nil
 }
@@ -306,25 +399,43 @@ func (a *Activities) reviewedFromWorkflow(ctx context.Context, workflowID string
 
 // StartReviewTargets signal-with-starts one review workflow per target
 // (same request shape as the webhook) with a GitHub API diffUrl.
-func (a *Activities) StartReviewTargets(ctx context.Context, targets []ReviewTarget) ([]string, error) {
+func (a *Activities) StartReviewTargets(ctx context.Context, targets []ReviewTarget) (started []string, err error) {
+	telemetry.RecordAttemptStarted(ctx, "StartReviewTargets", telemetry.Correlation{}, attemptAttrs(ctx)...)
+	defer func() {
+		outcome := telemetry.OutcomeReviewed
+		if err != nil {
+			outcome = telemetry.OutcomeFailed
+		}
+		telemetry.RecordAttemptFinished(ctx, "StartReviewTargets", outcome, telemetry.Classify(err, ""), telemetry.Correlation{},
+			append(attemptAttrs(ctx), attribute.Int(telemetry.AttrPollerTriggered, len(started)))...)
+	}()
 	if a.Temporal == nil {
 		return nil, temporal.NewNonRetryableApplicationError("StartReviewTargets needs a Temporal client", "NoTemporalClient", nil)
 	}
-	started := []string{}
+	started = []string{}
 	for _, t := range targets {
+		tc := corrTarget(t)
+		sctx, span := startSpan(ctx, telemetry.SpanStartTarget, tc)
 		request := ReviewRequest{
-			Repo:     t.Repo,
-			PRNumber: t.PRNumber,
-			Title:    t.Title,
-			HeadSHA:  t.HeadSHA,
-			DiffURL:  fmt.Sprintf("%s/repos/%s/pulls/%d", a.apiBase(), t.Repo, t.PRNumber),
-			LabelKey: t.LabelKey,
-			Label:    t.Label,
-			Model:    t.Model,
+			Repo:      t.Repo,
+			PRNumber:  t.PRNumber,
+			Title:     t.Title,
+			HeadSHA:   t.HeadSHA,
+			DiffURL:   fmt.Sprintf("%s/repos/%s/pulls/%d", a.apiBase(), t.Repo, t.PRNumber),
+			LabelKey:  t.LabelKey,
+			Label:     t.Label,
+			Model:     t.Model,
+			Forge:     telemetry.ForgeGitHub,
+			TraceLink: telemetry.TraceParent(sctx),
 		}
-		if err := StartReview(ctx, a.Temporal, a.TaskQueue, t.Key(), request); err != nil {
-			return started, err
+		telemetry.RecordCycleStarted(sctx, tc, request.TraceLink)
+		// Fresh trace for the review workflow: link, don't parent, under the poller.
+		startErr := StartReview(telemetry.WithoutSpan(sctx), a.Temporal, a.TaskQueue, t.Key(), request)
+		if startErr != nil {
+			telemetry.End(span, startErr, "")
+			return started, startErr
 		}
+		span.End()
 		started = append(started, fmt.Sprintf("%s#%d:%s@%.7s(%s)", t.Repo, t.PRNumber, t.LabelKey, t.HeadSHA, t.Model))
 	}
 	return started, nil

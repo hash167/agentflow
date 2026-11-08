@@ -7,6 +7,8 @@ package reviewer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"agent-gateway/internal/telemetry"
 )
 
 // Exit codes. The orchestrator treats ExitInvalidOutput and ExitBadInput as
@@ -105,8 +111,11 @@ func MCPConfig(url, keyEnv string) []byte {
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
 			MCPServerName: map[string]any{
-				"url":     url,
-				"headers": map[string]string{"Authorization": "Bearer ${env:" + keyEnv + "}"},
+				"url": url,
+				"headers": map[string]string{
+					"Authorization": "Bearer ${env:" + keyEnv + "}",
+					"traceparent":   "${env:TRACEPARENT}",
+				},
 			},
 		},
 	}
@@ -151,6 +160,16 @@ func Prompt(in Input, diffFile string, withGateway bool) string {
 	return b.String()
 }
 
+// PromptTemplateVersion is a human stamp for the prompt template (not the rendered prompt).
+const PromptTemplateVersion = "v1"
+
+// PromptTemplateHash is sha256 of Prompt() with placeholders (no real diff/title).
+func PromptTemplateHash() string {
+	in := Input{Repo: "{{repo}}", PRNumber: 0, Title: "{{title}}"}
+	sum := sha256.Sum256([]byte(Prompt(in, "{{diff_file}}", true)))
+	return hex.EncodeToString(sum[:])
+}
+
 // Args returns the Cursor CLI argv (without the binary).
 func Args(cfg Config, workdir, prompt string) []string {
 	args := []string{
@@ -173,34 +192,47 @@ func Args(cfg Config, workdir, prompt string) []string {
 	return append(args, prompt)
 }
 
-// cliResult is the --output-format json envelope.
-type cliResult struct {
-	Type    string `json:"type"`
-	Subtype string `json:"subtype"`
-	IsError bool   `json:"is_error"`
-	Result  string `json:"result"`
+// CLIEnvelope is the --output-format json envelope. Token usage is not present
+// in the documented CLI output and is never fabricated.
+type CLIEnvelope struct {
+	Type          string  `json:"type"`
+	Subtype       string  `json:"subtype"`
+	IsError       bool    `json:"is_error"`
+	Result        string  `json:"result"`
+	SessionID     string  `json:"session_id"`
+	RequestID     string  `json:"request_id"`
+	DurationMS    float64 `json:"duration_ms"`
+	DurationAPIMS float64 `json:"duration_api_ms"`
 }
 
 // ErrInvalidOutput marks a permanent failure: the model's answer was not a
 // valid verdict.
 var ErrInvalidOutput = errors.New("invalid reviewer output")
 
-// ParseCLIOutput unwraps the CLI's JSON envelope and returns the assistant text.
-func ParseCLIOutput(stdout []byte) (string, error) {
+// ParseCLIEnvelope unwraps the last JSON object the CLI printed.
+func ParseCLIEnvelope(stdout []byte) (CLIEnvelope, error) {
 	trimmed := bytes.TrimSpace(stdout)
-	// The envelope is the last non-empty line.
 	if i := bytes.LastIndexByte(trimmed, '\n'); i >= 0 {
 		trimmed = trimmed[i+1:]
 	}
-	var env cliResult
+	var env CLIEnvelope
 	if err := json.Unmarshal(trimmed, &env); err != nil {
-		return "", fmt.Errorf("%w: CLI did not print a JSON result envelope: %v (stdout: %.200q)", ErrInvalidOutput, err, stdout)
+		return CLIEnvelope{}, fmt.Errorf("%w: CLI did not print a JSON result envelope: %v", ErrInvalidOutput, err)
 	}
 	if env.Type != "result" {
-		return "", fmt.Errorf("%w: unexpected CLI envelope type %q", ErrInvalidOutput, env.Type)
+		return CLIEnvelope{}, fmt.Errorf("%w: unexpected CLI envelope type %q", ErrInvalidOutput, env.Type)
+	}
+	return env, nil
+}
+
+// ParseCLIOutput unwraps the CLI's JSON envelope and returns the assistant text.
+func ParseCLIOutput(stdout []byte) (string, error) {
+	env, err := ParseCLIEnvelope(stdout)
+	if err != nil {
+		return "", err
 	}
 	if env.IsError {
-		return "", fmt.Errorf("CLI reported an error result: %.300s", env.Result)
+		return "", fmt.Errorf("CLI reported an error result: %.300s", telemetry.Redact(env.Result))
 	}
 	return env.Result, nil
 }
@@ -306,37 +338,70 @@ func Validate(v *Verdict) error {
 // Run executes one review. It returns the process exit code.
 func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Writer) int {
 	logf := func(format string, args ...any) { fmt.Fprintf(stderr, "cursor-reviewer: "+format+"\n", args...) }
+	ctx = telemetry.ExtractEnv(ctx, os.Environ())
+	ctx, cliSpan := telemetry.Start(ctx, telemetry.SpanCLIRun,
+		attribute.String(telemetry.AttrGenAIOp, "invoke_agent"),
+		attribute.String(telemetry.AttrGenAIProvider, telemetry.ProviderCursor),
+		attribute.String(telemetry.AttrGenAIModel, cfg.Model),
+		attribute.String(telemetry.AttrCLIOutputFormat, "json"),
+		attribute.String(telemetry.AttrPromptVersion, PromptTemplateVersion),
+		attribute.String(telemetry.AttrPromptHash, PromptTemplateHash()),
+		attribute.Int(telemetry.AttrReviewerTimeoutS, int(cfg.Timeout.Seconds())),
+		attribute.Bool(telemetry.AttrReviewerGateway, cfg.GatewayURL != ""),
+		attribute.String(telemetry.AttrReviewerMode, cfg.Mode),
+	)
+	finish := func(code int, err error) int {
+		class := ""
+		if err != nil {
+			class = telemetry.Classify(err, "")
+			telemetry.SetOutcome(cliSpan, telemetry.OutcomeFor(err, "", "", 0, false), class, "")
+			telemetry.End(cliSpan, err, "")
+		} else {
+			cliSpan.End()
+		}
+		telemetry.Current().ForceFlush(2 * time.Second)
+		return code
+	}
 
 	raw, err := io.ReadAll(stdin)
 	if err != nil {
 		logf("cannot read stdin: %v", err)
-		return ExitBadInput
+		return finish(ExitBadInput, err)
 	}
 	var in Input
 	if err := json.Unmarshal(raw, &in); err != nil {
 		logf("invalid input JSON: %v", err)
-		return ExitBadInput
+		return finish(ExitBadInput, err)
 	}
 	if m := strings.TrimSpace(in.Model); m != "" {
 		cfg.Model = m
+		cliSpan.SetAttributes(attribute.String(telemetry.AttrGenAIModel, cfg.Model))
 	}
+	cliSpan.SetAttributes(
+		attribute.String(telemetry.AttrRepo, in.Repo),
+		attribute.Int(telemetry.AttrPRNumber, in.PRNumber),
+		attribute.Int(telemetry.AttrDiffBytes, len(in.Diff)),
+	)
 	if strings.TrimSpace(in.Diff) == "" {
 		logf("input has an empty diff")
-		return ExitBadInput
+		return finish(ExitBadInput, fmt.Errorf("empty diff"))
 	}
 	if os.Getenv("CURSOR_API_KEY") == "" {
 		logf("CURSOR_API_KEY is not set")
-		return ExitBadInput
+		return finish(ExitBadInput, fmt.Errorf("CURSOR_API_KEY is not set"))
 	}
 	gateway := cfg.GatewayURL != "" && os.Getenv(cfg.GatewayKeyEnv) != ""
 	if cfg.GatewayURL != "" && !gateway {
 		logf("%s not set; running without the MCP gateway", cfg.GatewayKeyEnv)
 	}
+	cliSpan.SetAttributes(attribute.Bool(telemetry.AttrReviewerGateway, gateway))
 
+	_, prep := telemetry.Start(ctx, telemetry.SpanReviewerPrepare)
 	workdir, err := os.MkdirTemp("", "cursor-review-*")
 	if err != nil {
 		logf("cannot create workdir: %v", err)
-		return ExitAgentFailed
+		telemetry.End(prep, err, "")
+		return finish(ExitAgentFailed, err)
 	}
 	defer os.RemoveAll(workdir)
 	home := filepath.Join(workdir, ".home")
@@ -344,24 +409,29 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Wri
 	for _, dir := range []string{home, filepath.Join(ws, ".cursor")} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			logf("cannot create %s: %v", dir, err)
-			return ExitAgentFailed
+			telemetry.End(prep, err, "")
+			return finish(ExitAgentFailed, err)
 		}
 	}
 	diffName := "pr.diff"
 	if err := os.WriteFile(filepath.Join(ws, diffName), []byte(in.Diff), 0o600); err != nil {
 		logf("cannot write diff: %v", err)
-		return ExitAgentFailed
+		telemetry.End(prep, err, "")
+		return finish(ExitAgentFailed, err)
 	}
 	if err := os.WriteFile(filepath.Join(ws, ".cursor", "cli.json"), CLIPermissions(), 0o600); err != nil {
 		logf("cannot write cli.json: %v", err)
-		return ExitAgentFailed
+		telemetry.End(prep, err, "")
+		return finish(ExitAgentFailed, err)
 	}
 	if gateway {
 		if err := os.WriteFile(filepath.Join(ws, ".cursor", "mcp.json"), MCPConfig(cfg.GatewayURL, cfg.GatewayKeyEnv), 0o600); err != nil {
 			logf("cannot write mcp.json: %v", err)
-			return ExitAgentFailed
+			telemetry.End(prep, err, "")
+			return finish(ExitAgentFailed, err)
 		}
 	}
+	telemetry.End(prep, nil, "")
 
 	runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
@@ -369,10 +439,15 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Wri
 	if !gateway {
 		effective.GatewayURL = ""
 	}
+	_, sub := telemetry.Start(ctx, telemetry.SpanReviewerSubproc)
 	cmd := exec.CommandContext(runCtx, cfg.AgentBin, Args(effective, ws, Prompt(in, diffName, gateway))...)
 	cmd.Dir = ws
 	// Isolated HOME per run: concurrent reviews never share ~/.cursor state.
-	cmd.Env = append(os.Environ(), "HOME="+home, "XDG_CACHE_HOME="+filepath.Join(home, ".cache"), "XDG_CONFIG_HOME="+filepath.Join(home, ".config"))
+	cmd.Env = telemetry.ChildEnv(append(os.Environ(),
+		"HOME="+home,
+		"XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
+		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+	), ctx, "cursor-reviewer")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second
@@ -384,31 +459,77 @@ func Run(ctx context.Context, cfg Config, stdin io.Reader, stdout, stderr io.Wri
 	logf("running %s --model %s (gateway=%v, timeout=%s)", filepath.Base(cfg.AgentBin), cfg.Model, gateway, cfg.Timeout)
 	runErr := cmd.Run()
 	elapsed := time.Since(started).Round(time.Millisecond)
+	if cmd.Process != nil {
+		sub.SetAttributes(attribute.Int(telemetry.AttrProcessPID, cmd.Process.Pid))
+	}
 	if runCtx.Err() == context.DeadlineExceeded {
 		logf("agent timed out after %s", cfg.Timeout)
-		return ExitAgentFailed
+		sub.SetAttributes(attribute.String(telemetry.AttrReviewerExitClass, "killed"))
+		telemetry.End(sub, runCtx.Err(), "")
+		return finish(ExitAgentFailed, runCtx.Err())
 	}
 	if runErr != nil {
 		logf("agent failed after %s: %v", elapsed, runErr)
-		return ExitAgentFailed
+		class := telemetry.Classify(runErr, "")
+		sub.SetAttributes(attribute.String(telemetry.AttrReviewerExitClass, "agent_failed"), attribute.String(telemetry.AttrErrorClass, class))
+		telemetry.End(sub, runErr, "")
+		return finish(ExitAgentFailed, runErr)
 	}
-	text, err := ParseCLIOutput(out.Bytes())
+	sub.SetAttributes(attribute.String(telemetry.AttrReviewerExitClass, "ok"), attribute.Int(telemetry.AttrProcessExit, 0))
+	telemetry.End(sub, nil, "")
+
+	_, parse := telemetry.Start(ctx, telemetry.SpanReviewerParse, attribute.String(telemetry.AttrParseStage, "envelope"))
+	env, err := ParseCLIEnvelope(out.Bytes())
 	if err != nil {
-		logf("%v", err)
+		logf("%v", telemetry.Redact(err.Error()))
+		telemetry.End(parse, err, "")
 		if errors.Is(err, ErrInvalidOutput) {
-			return ExitInvalidOutput
+			return finish(ExitInvalidOutput, err)
 		}
-		return ExitAgentFailed
+		return finish(ExitAgentFailed, err)
 	}
+	if env.SessionID != "" {
+		cliSpan.SetAttributes(attribute.String(telemetry.AttrCLISession, env.SessionID))
+	}
+	if env.RequestID != "" {
+		cliSpan.SetAttributes(attribute.String(telemetry.AttrCLIRequest, env.RequestID))
+	}
+	cliSpan.SetAttributes(
+		attribute.Int64(telemetry.AttrCLIDurationMS, int64(env.DurationMS)),
+		attribute.Int64(telemetry.AttrCLIDurationAPIMS, int64(env.DurationAPIMS)),
+		attribute.Bool(telemetry.AttrCLIIsError, env.IsError),
+	)
+	if env.IsError {
+		err := fmt.Errorf("CLI reported an error result: %s", telemetry.Truncate(telemetry.Redact(env.Result), 300))
+		parse.SetAttributes(attribute.String(telemetry.AttrErrorClass, telemetry.Classify(err, "")))
+		telemetry.End(parse, err, "")
+		logf("CLI reported an error result")
+		return finish(ExitAgentFailed, err)
+	}
+	text := env.Result
 	verdict, err := ExtractVerdict(text)
 	if err != nil {
-		logf("%v", err)
-		return ExitInvalidOutput
+		logf("%v", telemetry.Redact(err.Error()))
+		parse.SetAttributes(attribute.String(telemetry.AttrParseStage, "verdict"))
+		telemetry.End(parse, err, "")
+		return finish(ExitInvalidOutput, err)
 	}
+	parse.SetAttributes(
+		attribute.String(telemetry.AttrParseStage, "validate"),
+		attribute.Int(telemetry.AttrFindingsCount, len(verdict.Findings)),
+	)
+	telemetry.End(parse, nil, "")
 	logf("verdict ok in %s: %d finding(s)", elapsed, len(verdict.Findings))
 	if err := json.NewEncoder(stdout).Encode(verdict); err != nil {
 		logf("cannot write verdict: %v", err)
-		return ExitAgentFailed
+		return finish(ExitAgentFailed, err)
 	}
+	outcome := telemetry.OutcomeReviewed
+	if len(verdict.Findings) == 0 {
+		outcome = telemetry.OutcomeReviewedClean
+	}
+	telemetry.SetOutcome(cliSpan, outcome, "", "")
+	cliSpan.End()
+	telemetry.Current().ForceFlush(2 * time.Second)
 	return ExitOK
 }
